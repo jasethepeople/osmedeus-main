@@ -1,0 +1,62 @@
+# Osmedeus Toolbox Dockerfile
+# Full-featured image with all security tools pre-installed via direct-fetch
+# Based on Ubuntu 24.04 LTS with Python3
+
+FROM ubuntu:24.04
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies, Python3, and Go
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    wget \
+    git \
+    unzip \
+    jq \
+    bash \
+    xz-utils \
+    python3 \
+    python3-pip \
+    python3-venv \
+    chromium-browser \
+    sudo \
+    golang-go \
+    && update-ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create symlink for python
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+
+# Set up Go environment
+ENV PATH="/root/go/bin:${PATH}"
+ENV GOPATH="/root/go"
+
+# Create base directories
+RUN mkdir -p /root/osmedeus-base /root/workspaces-osmedeus /root/go/bin
+
+WORKDIR /root
+
+# Install osmedeus via official install script
+# Note: Using --insecure due to SSL certificate issues in Docker build environment
+RUN curl -fsSLk https://www.osmedeus.org/install.sh | bash
+
+# Set up PATH for osmedeus and external binaries
+ENV PATH="/root/.local/bin:/root/go/bin:/root/osmedeus-base/external-binaries:${PATH}"
+
+
+# Run osmedeus health check to verify installation
+RUN osmedeus health
+
+# # Install binaries via direct-fetch (including optional ones)
+# RUN osmedeus install binary --all true
+
+# Expose default server port
+EXPOSE 8002
+
+# Default command shows help
+CMD ["osmedeus"]
+
+# enable below for server mode
+# CMD ["osmedeus", "serve", "--debug", "--port", "8002", "--host", "0.0.0.0"]

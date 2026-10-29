@@ -1,0 +1,59 @@
+name: Nightly Release
+
+on:
+  schedule:
+    # Run every Sunday at 00:00 UTC
+    - cron: "0 0 * * 0"
+  workflow_dispatch:
+    # Allow manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  nightly-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Delete existing nightly release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v0.0.0-nightly"
+          gh release view "$TAG" --json assets -q '.assets[].name' | while read -r asset; do
+            echo "Deleting asset: $asset"
+            gh release delete-asset "$TAG" "$asset" --yes
+          done
+
+      - name: Create release notes
+        run: |
+          cat << 'EOF' > /tmp/release-notes.md
+          ## Nightly Build
+
+          > **Note**: This is a nightly build, not a tagged release. Even though you enjoy the latest features, things may change when the official release.
+
+          Built from commit: ${{ github.sha }}
+          EOF
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean --skip=validate --parallelism=1 --release-notes=/tmp/release-notes.md --config test/goreleaser-nightly.yaml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: v0.0.0-nightly
+          GOGC: "50"
+          GOMEMLIMIT: "5GiB"

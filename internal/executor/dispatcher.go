@@ -1,0 +1,1265 @@
+package executor
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+
+	"github.com/j3ssie/osmedeus/v5/internal/config"
+	"github.com/j3ssie/osmedeus/v5/internal/core"
+	"github.com/j3ssie/osmedeus/v5/internal/functions"
+	"github.com/j3ssie/osmedeus/v5/internal/logger"
+	"github.com/j3ssie/osmedeus/v5/internal/runner"
+	"github.com/j3ssie/osmedeus/v5/internal/template"
+	"github.com/j3ssie/osmedeus/v5/internal/terminal"
+	"go.uber.org/zap"
+)
+
+// functionCallPattern matches function call syntax like functionName(...)
+var functionCallPattern = regexp.MustCompile(`\w+\s*\(`)
+
+// StepDispatcher dispatches steps to appropriate executors
+type StepDispatcher struct {
+	registry         *PluginRegistry
+	templateEngine   template.TemplateEngine
+	batchRenderer    template.BatchRenderer // For optimized batch rendering
+	functionRegistry *functions.Registry
+	dryRun           bool
+	runner           runner.Runner
+	enableBatch      bool // Enable batch template rendering
+	printer          *terminal.Printer
+	// Keep direct references to executors that need special configuration
+	bashExecutor  *BashExecutor
+	llmExecutor   *LLMExecutor
+	agentExecutor *AgentExecutor
+}
+
+// SetDryRun enables or disables dry-run mode for the dispatcher
+func (d *StepDispatcher) SetDryRun(dryRun bool) {
+	d.dryRun = dryRun
+}
+
+// SetSilent enables or disables silent mode for executors that support it
+func (d *StepDispatcher) SetSilent(silent bool) {
+	d.llmExecutor.SetSilent(silent)
+	d.agentExecutor.SetSilent(silent)
+}
+
+// SetPrinter sets the terminal printer for user-facing messages
+func (d *StepDispatcher) SetPrinter(p *terminal.Printer) {
+	d.printer = p
+}
+
+// SetRunner sets the runner for command execution
+func (d *StepDispatcher) SetRunner(r runner.Runner) {
+	d.runner = r
+	d.bashExecutor.SetRunner(r)
+}
+
+// StepDispatcherConfig holds configuration for the step dispatcher
+type StepDispatcherConfig struct {
+	UseShardedEngine bool // Use sharded template engine for better concurrency
+	EnableBatch      bool // Enable batch template rendering
+	ShardCount       int  // Number of shards (default: 16)
+	ShardCacheSize   int  // Cache size per shard (default: 64)
+}
+
+// DefaultStepDispatcherConfig returns the default configuration
+func DefaultStepDispatcherConfig() StepDispatcherConfig {
+	return StepDispatcherConfig{
+		UseShardedEngine: true, // Default to sharded engine for better performance
+		EnableBatch:      true, // Default to batch rendering
+		ShardCount:       16,
+		ShardCacheSize:   64,
+	}
+}
+
+// NewStepDispatcher creates a new step dispatcher with default configuration
+func NewStepDispatcher() *StepDispatcher {
+	return NewStepDispatcherWithConfig(DefaultStepDispatcherConfig())
+}
+
+// NewStepDispatcherWithConfig creates a new step dispatcher with custom configuration
+func NewStepDispatcherWithConfig(cfg StepDispatcherConfig) *StepDispatcher {
+	var engine template.TemplateEngine
+	var batchRenderer template.BatchRenderer
+
+	if cfg.UseShardedEngine {
+		shardedCfg := template.ShardedEngineConfig{
+			ShardCount:     cfg.ShardCount,
+			ShardCacheSize: cfg.ShardCacheSize,
+			EnablePooling:  true,
+		}
+		shardedEngine := template.NewShardedEngineWithConfig(shardedCfg)
+		engine = shardedEngine
+		batchRenderer = shardedEngine
+	} else {
+		stdEngine := template.NewEngine()
+		engine = stdEngine
+		batchRenderer = stdEngine
+	}
+
+	d := &StepDispatcher{
+		registry:         NewPluginRegistry(),
+		templateEngine:   engine,
+		batchRenderer:    batchRenderer,
+		functionRegistry: functions.NewRegistry(),
+		enableBatch:      cfg.EnableBatch,
+	}
+
+	// Create executors
+	d.bashExecutor = NewBashExecutor(engine)
+	d.llmExecutor = NewLLMExecutor(engine)
+	d.agentExecutor = NewAgentExecutor(engine, d.functionRegistry)
+
+	// Register all built-in plugins
+	d.registry.Register(d.bashExecutor)
+	d.registry.Register(NewFunctionExecutor(engine, d.functionRegistry))
+	d.registry.Register(NewParallelExecutor(d))
+	d.registry.Register(NewForeachExecutor(d, engine, d.functionRegistry))
+	d.registry.Register(NewRemoteBashExecutor(engine))
+	d.registry.Register(NewHTTPExecutor(engine))
+	d.registry.Register(d.llmExecutor)
+	d.registry.Register(d.agentExecutor)
+	d.registry.Register(NewACPExecutor(engine))
+	d.registry.Register(NewSDKExecutor(engine))
+
+	return d
+}
+
+// RegisterPlugin allows external plugin registration
+func (d *StepDispatcher) RegisterPlugin(plugin StepExecutorPlugin) {
+	d.registry.Register(plugin)
+}
+
+// SetConfig passes config to executors that need it
+func (d *StepDispatcher) SetConfig(cfg *config.Config) {
+	d.llmExecutor.SetConfig(cfg)
+	d.agentExecutor.SetConfig(cfg)
+}
+
+// Dispatch dispatches a step to the appropriate executor
+func (d *StepDispatcher) Dispatch(ctx context.Context, step *core.Step, execCtx *core.ExecutionContext) (*core.StepResult, error) {
+	log := logger.Get()
+
+	log.Debug("Dispatching step",
+		zap.String("step_name", step.Name),
+		zap.String("step_type", string(step.Type)),
+		zap.Bool("dry_run", d.dryRun),
+	)
+
+	// Render templates in step fields
+	log.Debug("Rendering step templates")
+	renderedStep, err := d.renderStep(step, execCtx)
+	if err != nil {
+		log.Debug("Template rendering failed", zap.Error(err))
+		return nil, fmt.Errorf("template rendering failed: %w", err)
+	}
+
+	log.Debug("Step templates rendered",
+		zap.String("command", renderedStep.Command),
+	)
+
+	// Dispatch based on step type using plugin registry
+	log.Debug("Dispatching to executor",
+		zap.String("executor_type", string(step.Type)),
+	)
+
+	plugin, ok := d.registry.Get(step.Type)
+	if !ok {
+		return nil, fmt.Errorf("unknown step type: %s", step.Type)
+	}
+
+	log.Debug("Using plugin", zap.String("plugin_name", plugin.Name()))
+	result, err := plugin.Execute(ctx, renderedStep, execCtx)
+
+	if err != nil {
+		log.Debug("Step execution failed",
+			zap.String("step", step.Name),
+			zap.Error(err),
+		)
+		return result, err
+	}
+
+	log.Debug("Step execution completed",
+		zap.String("step", step.Name),
+		zap.String("status", string(result.Status)),
+	)
+
+	// Process exports
+	if step.HasExports() {
+		log.Debug("Processing exports",
+			zap.Int("export_count", len(step.Exports)),
+		)
+
+		// Merge auto-exports (e.g., from HTTP steps) into vars before evaluating user exports
+		vars := execCtx.GetVariables()
+		if result.Exports != nil {
+			for k, v := range result.Exports {
+				vars[k] = v
+			}
+		}
+
+		// Render template variables in export values first, then evaluate if needed
+		exports := make(map[string]interface{}, len(step.Exports))
+		for name, expr := range step.Exports {
+			rendered, err := d.templateEngine.Render(expr, vars)
+			if err != nil {
+				log.Warn("Failed to render export value, using original",
+					zap.String("export", name),
+					zap.Error(err))
+				rendered = expr
+			}
+
+			// Only evaluate with JS if the rendered value contains a function call
+			// Otherwise, use the rendered string directly
+			if functionCallPattern.MatchString(rendered) {
+				value, err := d.functionRegistry.Execute(rendered, vars)
+				if err != nil {
+					return result, fmt.Errorf("export evaluation failed for %s: %w", name, err)
+				}
+				exports[name] = value
+			} else {
+				// Use rendered value directly as a string
+				exports[name] = rendered
+			}
+		}
+		if result.Exports == nil {
+			result.Exports = make(map[string]interface{})
+		}
+		for k, v := range exports {
+			result.Exports[k] = v
+		}
+		log.Debug("Exports processed", zap.Int("total_exports", len(result.Exports)))
+	}
+
+	return result, nil
+}
+
+// collectRenderRequests gathers all non-empty template strings from a step
+func collectRenderRequests(step *core.Step) []template.RenderRequest {
+	var requests []template.RenderRequest
+	add := func(key, tmpl string) {
+		if tmpl != "" {
+			requests = append(requests, template.RenderRequest{Key: key, Template: tmpl})
+		}
+	}
+
+	// String fields
+	add("Command", step.Command)
+	add("SpeedArgs", step.SpeedArgs)
+	add("ConfigArgs", step.ConfigArgs)
+	add("InputArgs", step.InputArgs)
+	add("OutputArgs", step.OutputArgs)
+	add("StdFile", step.StdFile)
+	add("Function", step.Function)
+	add("Input", step.Input)
+	add("VariablePreProcess", step.VariablePreProcess)
+	add("Log", step.Log)
+	add("Timeout", string(step.Timeout))
+	add("Threads", string(step.Threads))
+	add("URL", step.URL)
+	add("Method", step.Method)
+	add("RequestBody", step.RequestBody)
+	add("StepRunner", string(step.StepRunner))
+	add("StepRemoteFile", step.StepRemoteFile)
+	add("HostOutputFile", step.HostOutputFile)
+
+	// Slice fields
+	for i, cmd := range step.Commands {
+		add(fmt.Sprintf("Commands[%d]", i), cmd)
+	}
+	for i, cmd := range step.ParallelCommands {
+		add(fmt.Sprintf("ParallelCommands[%d]", i), cmd)
+	}
+	for i, fn := range step.Functions {
+		add(fmt.Sprintf("Functions[%d]", i), fn)
+	}
+	for i, fn := range step.ParallelFunctions {
+		add(fmt.Sprintf("ParallelFunctions[%d]", i), fn)
+	}
+	for i, input := range step.EmbeddingInput {
+		add(fmt.Sprintf("EmbeddingInput[%d]", i), input)
+	}
+
+	// Map fields
+	for k, v := range step.Headers {
+		add(fmt.Sprintf("Headers[%s]", k), v)
+	}
+
+	// Agent step fields
+	add("Query", step.Query)
+	add("SystemPrompt", step.SystemPrompt)
+	add("StopCondition", step.StopCondition)
+	add("PlanPrompt", step.PlanPrompt)
+	add("OnToolStart", step.OnToolStart)
+	add("OnToolEnd", step.OnToolEnd)
+	for i, q := range step.Queries {
+		add(fmt.Sprintf("Queries[%d]", i), q)
+	}
+	if step.Memory != nil {
+		add("Memory.PersistPath", step.Memory.PersistPath)
+		add("Memory.ResumePath", step.Memory.ResumePath)
+	}
+	for i, tool := range step.AgentTools {
+		add(fmt.Sprintf("AgentTools[%d].Handler", i), tool.Handler)
+	}
+
+	// Sub-agent fields (only top-level; nested sub-agents rendered on spawn)
+	for i, sa := range step.SubAgents {
+		add(fmt.Sprintf("SubAgents[%d].SystemPrompt", i), sa.SystemPrompt)
+		add(fmt.Sprintf("SubAgents[%d].StopCondition", i), sa.StopCondition)
+		add(fmt.Sprintf("SubAgents[%d].OnToolStart", i), sa.OnToolStart)
+		add(fmt.Sprintf("SubAgents[%d].OnToolEnd", i), sa.OnToolEnd)
+		if sa.Memory != nil {
+			add(fmt.Sprintf("SubAgents[%d].Memory.PersistPath", i), sa.Memory.PersistPath)
+			add(fmt.Sprintf("SubAgents[%d].Memory.ResumePath", i), sa.Memory.ResumePath)
+		}
+		for j, tool := range sa.AgentTools {
+			add(fmt.Sprintf("SubAgents[%d].AgentTools[%d].Handler", i, j), tool.Handler)
+		}
+	}
+
+	// Agent-ACP step fields
+	add("Agent", step.Agent)
+	add("Cwd", step.Cwd)
+	for i, p := range step.AllowedPaths {
+		add(fmt.Sprintf("AllowedPaths[%d]", i), p)
+	}
+	if step.ACPConfig != nil {
+		add("ACPConfig.Command", step.ACPConfig.Command)
+		for i, arg := range step.ACPConfig.Args {
+			add(fmt.Sprintf("ACPConfig.Args[%d]", i), arg)
+		}
+		for k, v := range step.ACPConfig.Env {
+			add(fmt.Sprintf("ACPConfig.Env[%s]", k), v)
+		}
+	}
+
+	// Agent-SDK step fields
+	if step.SDKConfig != nil {
+		add("SDKConfig.Model", step.SDKConfig.Model)
+		add("SDKConfig.PermissionMode", step.SDKConfig.PermissionMode)
+		add("SDKConfig.Sandbox", step.SDKConfig.Sandbox)
+		add("SDKConfig.Strategy", step.SDKConfig.Strategy)
+		add("SDKConfig.SessionResume", step.SDKConfig.SessionResume)
+		for k, v := range step.SDKConfig.Env {
+			add(fmt.Sprintf("SDKConfig.Env[%s]", k), v)
+		}
+		for i, a := range step.SDKConfig.Agents {
+			add(fmt.Sprintf("SDKConfig.Agents[%d]", i), a)
+		}
+	}
+
+	// RunnerConfig fields
+	if step.StepRunnerConfig != nil && step.StepRunnerConfig.RunnerConfig != nil {
+		cfg := step.StepRunnerConfig.RunnerConfig
+		add("RunnerConfig.Image", cfg.Image)
+		add("RunnerConfig.Host", cfg.Host)
+		add("RunnerConfig.User", cfg.User)
+		add("RunnerConfig.Password", cfg.Password)
+		add("RunnerConfig.KeyFile", cfg.KeyFile)
+		add("RunnerConfig.WorkDir", cfg.WorkDir)
+		add("RunnerConfig.Network", cfg.Network)
+		for k, v := range cfg.Env {
+			add(fmt.Sprintf("RunnerConfig.Env[%s]", k), v)
+		}
+		for i, v := range cfg.Volumes {
+			add(fmt.Sprintf("RunnerConfig.Volumes[%d]", i), v)
+		}
+	}
+
+	return requests
+}
+
+// renderStep renders all template fields in a step
+func (d *StepDispatcher) renderStep(step *core.Step, execCtx *core.ExecutionContext) (*core.Step, error) {
+	vars := execCtx.GetVariables()
+
+	// Use batch rendering if enabled and available
+	if d.enableBatch && d.batchRenderer != nil {
+		return d.renderStepBatch(step, vars)
+	}
+
+	return d.renderStepSequential(step, vars)
+}
+
+// renderStepBatch renders step templates using batch mode for fewer lock acquisitions
+func (d *StepDispatcher) renderStepBatch(step *core.Step, vars map[string]any) (*core.Step, error) {
+	requests := collectRenderRequests(step)
+	if len(requests) == 0 {
+		// No templates to render, but still need to handle LLM messages
+		if len(step.Messages) > 0 {
+			rendered := *step
+			if err := d.renderLLMMessages(&rendered, vars); err != nil {
+				return nil, err
+			}
+			return &rendered, nil
+		}
+		return step, nil
+	}
+
+	results, err := d.batchRenderer.RenderBatch(requests, vars)
+	if err != nil {
+		return nil, err
+	}
+
+	rendered := *step
+	get := func(key string) string { return results[key] }
+
+	// Apply results to string fields
+	if v := get("Command"); v != "" {
+		rendered.Command = v
+	}
+	if v := get("SpeedArgs"); v != "" {
+		rendered.SpeedArgs = v
+	}
+	if v := get("ConfigArgs"); v != "" {
+		rendered.ConfigArgs = v
+	}
+	if v := get("InputArgs"); v != "" {
+		rendered.InputArgs = v
+	}
+	if v := get("OutputArgs"); v != "" {
+		rendered.OutputArgs = v
+	}
+	if v := get("StdFile"); v != "" {
+		rendered.StdFile = v
+	}
+	if v := get("Function"); v != "" {
+		rendered.Function = v
+	}
+	if v := get("Input"); v != "" {
+		rendered.Input = v
+	}
+	if v := get("VariablePreProcess"); v != "" {
+		rendered.VariablePreProcess = v
+	}
+	if v := get("Log"); v != "" {
+		rendered.Log = v
+	}
+	if v := get("Timeout"); v != "" {
+		rendered.Timeout = core.StepTimeout(v)
+	}
+	if v := get("Threads"); v != "" {
+		rendered.Threads = core.StepThreads(v)
+	}
+	if v := get("URL"); v != "" {
+		rendered.URL = v
+	}
+	if v := get("Method"); v != "" {
+		rendered.Method = v
+	}
+	if v := get("RequestBody"); v != "" {
+		rendered.RequestBody = v
+	}
+	if v := get("StepRunner"); v != "" {
+		rendered.StepRunner = core.RunnerType(v)
+	}
+	if v := get("StepRemoteFile"); v != "" {
+		rendered.StepRemoteFile = v
+	}
+	if v := get("HostOutputFile"); v != "" {
+		rendered.HostOutputFile = v
+	}
+	// Agent step fields
+	if v := get("Query"); v != "" {
+		rendered.Query = v
+	}
+	if v := get("SystemPrompt"); v != "" {
+		rendered.SystemPrompt = v
+	}
+	if v := get("StopCondition"); v != "" {
+		rendered.StopCondition = v
+	}
+	if v := get("PlanPrompt"); v != "" {
+		rendered.PlanPrompt = v
+	}
+	if v := get("OnToolStart"); v != "" {
+		rendered.OnToolStart = v
+	}
+	if v := get("OnToolEnd"); v != "" {
+		rendered.OnToolEnd = v
+	}
+	// Render Queries slice
+	if len(step.Queries) > 0 {
+		rendered.Queries = make([]string, len(step.Queries))
+		for i := range step.Queries {
+			rendered.Queries[i] = get(fmt.Sprintf("Queries[%d]", i))
+		}
+	}
+	if step.Memory != nil {
+		mem := *step.Memory
+		if v := get("Memory.PersistPath"); v != "" {
+			mem.PersistPath = v
+		}
+		if v := get("Memory.ResumePath"); v != "" {
+			mem.ResumePath = v
+		}
+		rendered.Memory = &mem
+	}
+	// Apply results to agent tool handlers
+	if len(step.AgentTools) > 0 {
+		renderedTools := make([]core.AgentToolDef, len(step.AgentTools))
+		copy(renderedTools, step.AgentTools)
+		for i := range renderedTools {
+			if v := get(fmt.Sprintf("AgentTools[%d].Handler", i)); v != "" {
+				renderedTools[i].Handler = v
+			}
+		}
+		rendered.AgentTools = renderedTools
+	}
+	// Apply results to sub-agent fields
+	if len(step.SubAgents) > 0 {
+		renderedSAs := make([]core.SubAgentDef, len(step.SubAgents))
+		for i, sa := range step.SubAgents {
+			renderedSAs[i] = sa.DeepCopy()
+			if v := get(fmt.Sprintf("SubAgents[%d].SystemPrompt", i)); v != "" {
+				renderedSAs[i].SystemPrompt = v
+			}
+			if v := get(fmt.Sprintf("SubAgents[%d].StopCondition", i)); v != "" {
+				renderedSAs[i].StopCondition = v
+			}
+			if v := get(fmt.Sprintf("SubAgents[%d].OnToolStart", i)); v != "" {
+				renderedSAs[i].OnToolStart = v
+			}
+			if v := get(fmt.Sprintf("SubAgents[%d].OnToolEnd", i)); v != "" {
+				renderedSAs[i].OnToolEnd = v
+			}
+			if sa.Memory != nil {
+				if renderedSAs[i].Memory == nil {
+					mem := *sa.Memory
+					renderedSAs[i].Memory = &mem
+				}
+				if v := get(fmt.Sprintf("SubAgents[%d].Memory.PersistPath", i)); v != "" {
+					renderedSAs[i].Memory.PersistPath = v
+				}
+				if v := get(fmt.Sprintf("SubAgents[%d].Memory.ResumePath", i)); v != "" {
+					renderedSAs[i].Memory.ResumePath = v
+				}
+			}
+			for j := range sa.AgentTools {
+				if v := get(fmt.Sprintf("SubAgents[%d].AgentTools[%d].Handler", i, j)); v != "" {
+					renderedSAs[i].AgentTools[j].Handler = v
+				}
+			}
+		}
+		rendered.SubAgents = renderedSAs
+	}
+
+	// Agent-ACP step fields
+	if v := get("Agent"); v != "" {
+		rendered.Agent = v
+	}
+	if v := get("Cwd"); v != "" {
+		rendered.Cwd = v
+	}
+	if len(step.AllowedPaths) > 0 {
+		rendered.AllowedPaths = make([]string, len(step.AllowedPaths))
+		for i := range step.AllowedPaths {
+			rendered.AllowedPaths[i] = get(fmt.Sprintf("AllowedPaths[%d]", i))
+		}
+	}
+	if step.ACPConfig != nil {
+		cfg := *step.ACPConfig
+		if v := get("ACPConfig.Command"); v != "" {
+			cfg.Command = v
+		}
+		if len(step.ACPConfig.Args) > 0 {
+			cfg.Args = make([]string, len(step.ACPConfig.Args))
+			for i := range step.ACPConfig.Args {
+				cfg.Args[i] = get(fmt.Sprintf("ACPConfig.Args[%d]", i))
+			}
+		}
+		if len(step.ACPConfig.Env) > 0 {
+			cfg.Env = make(map[string]string, len(step.ACPConfig.Env))
+			for k := range step.ACPConfig.Env {
+				cfg.Env[k] = get(fmt.Sprintf("ACPConfig.Env[%s]", k))
+			}
+		}
+		rendered.ACPConfig = &cfg
+	}
+
+	// Agent-SDK step fields
+	if step.SDKConfig != nil {
+		cfg := *step.SDKConfig
+		if v := get("SDKConfig.Model"); v != "" {
+			cfg.Model = v
+		}
+		if v := get("SDKConfig.PermissionMode"); v != "" {
+			cfg.PermissionMode = v
+		}
+		if v := get("SDKConfig.Sandbox"); v != "" {
+			cfg.Sandbox = v
+		}
+		if v := get("SDKConfig.Strategy"); v != "" {
+			cfg.Strategy = v
+		}
+		if v := get("SDKConfig.SessionResume"); v != "" {
+			cfg.SessionResume = v
+		}
+		if len(step.SDKConfig.Env) > 0 {
+			cfg.Env = make(map[string]string, len(step.SDKConfig.Env))
+			for k := range step.SDKConfig.Env {
+				cfg.Env[k] = get(fmt.Sprintf("SDKConfig.Env[%s]", k))
+			}
+		}
+		if len(step.SDKConfig.Agents) > 0 {
+			cfg.Agents = make([]string, len(step.SDKConfig.Agents))
+			for i := range step.SDKConfig.Agents {
+				cfg.Agents[i] = get(fmt.Sprintf("SDKConfig.Agents[%d]", i))
+			}
+		}
+		rendered.SDKConfig = &cfg
+	}
+
+	// Apply results to slice fields
+	if len(step.Commands) > 0 {
+		rendered.Commands = make([]string, len(step.Commands))
+		for i := range step.Commands {
+			rendered.Commands[i] = get(fmt.Sprintf("Commands[%d]", i))
+		}
+	}
+	if len(step.ParallelCommands) > 0 {
+		rendered.ParallelCommands = make([]string, len(step.ParallelCommands))
+		for i := range step.ParallelCommands {
+			rendered.ParallelCommands[i] = get(fmt.Sprintf("ParallelCommands[%d]", i))
+		}
+	}
+	if len(step.Functions) > 0 {
+		rendered.Functions = make([]string, len(step.Functions))
+		for i := range step.Functions {
+			rendered.Functions[i] = get(fmt.Sprintf("Functions[%d]", i))
+		}
+	}
+	if len(step.ParallelFunctions) > 0 {
+		rendered.ParallelFunctions = make([]string, len(step.ParallelFunctions))
+		for i := range step.ParallelFunctions {
+			rendered.ParallelFunctions[i] = get(fmt.Sprintf("ParallelFunctions[%d]", i))
+		}
+	}
+	if len(step.EmbeddingInput) > 0 {
+		rendered.EmbeddingInput = make([]string, len(step.EmbeddingInput))
+		for i := range step.EmbeddingInput {
+			rendered.EmbeddingInput[i] = get(fmt.Sprintf("EmbeddingInput[%d]", i))
+		}
+	}
+
+	// Apply results to map fields
+	if len(step.Headers) > 0 {
+		rendered.Headers = make(map[string]string, len(step.Headers))
+		for k := range step.Headers {
+			rendered.Headers[k] = get(fmt.Sprintf("Headers[%s]", k))
+		}
+	}
+
+	// Apply results to RunnerConfig
+	if step.StepRunnerConfig != nil && step.StepRunnerConfig.RunnerConfig != nil {
+		cfg := *step.StepRunnerConfig.RunnerConfig
+		if v := get("RunnerConfig.Image"); v != "" {
+			cfg.Image = v
+		}
+		if v := get("RunnerConfig.Host"); v != "" {
+			cfg.Host = v
+		}
+		if v := get("RunnerConfig.User"); v != "" {
+			cfg.User = v
+		}
+		if v := get("RunnerConfig.Password"); v != "" {
+			cfg.Password = v
+		}
+		if v := get("RunnerConfig.KeyFile"); v != "" {
+			cfg.KeyFile = v
+		}
+		if v := get("RunnerConfig.WorkDir"); v != "" {
+			cfg.WorkDir = v
+		}
+		if v := get("RunnerConfig.Network"); v != "" {
+			cfg.Network = v
+		}
+		// Apply Env map
+		if len(step.StepRunnerConfig.Env) > 0 {
+			cfg.Env = make(map[string]string, len(step.StepRunnerConfig.Env))
+			for k := range step.StepRunnerConfig.Env {
+				cfg.Env[k] = get(fmt.Sprintf("RunnerConfig.Env[%s]", k))
+			}
+		}
+		// Apply Volumes slice
+		if len(step.StepRunnerConfig.Volumes) > 0 {
+			cfg.Volumes = make([]string, len(step.StepRunnerConfig.Volumes))
+			for i := range step.StepRunnerConfig.Volumes {
+				cfg.Volumes[i] = get(fmt.Sprintf("RunnerConfig.Volumes[%d]", i))
+			}
+		}
+		rendered.StepRunnerConfig = &core.StepRunnerConfig{RunnerConfig: &cfg}
+	}
+
+	// LLM messages handled separately (complex nested structure)
+	if len(step.Messages) > 0 {
+		if err := d.renderLLMMessages(&rendered, vars); err != nil {
+			return nil, err
+		}
+	}
+
+	return &rendered, nil
+}
+
+// renderLLMMessages renders LLM message templates (complex nested structure)
+func (d *StepDispatcher) renderLLMMessages(rendered *core.Step, vars map[string]any) error {
+	renderedMessages := make([]core.LLMMessage, len(rendered.Messages))
+	for i, msg := range rendered.Messages {
+		renderedMsg := msg
+
+		// Render content (can be string or []interface{})
+		switch content := msg.Content.(type) {
+		case string:
+			renderedContent, err := d.templateEngine.Render(content, vars)
+			if err != nil {
+				return fmt.Errorf("error rendering message content: %w", err)
+			}
+			renderedMsg.Content = renderedContent
+		case []interface{}:
+			// Handle multimodal content parts
+			renderedParts := make([]interface{}, len(content))
+			for j, part := range content {
+				if partMap, ok := part.(map[string]interface{}); ok {
+					renderedPartMap := make(map[string]interface{})
+					for k, v := range partMap {
+						renderedPartMap[k] = v
+					}
+					// Render text field
+					if text, ok := partMap["text"].(string); ok {
+						renderedText, err := d.templateEngine.Render(text, vars)
+						if err != nil {
+							return fmt.Errorf("error rendering content part text: %w", err)
+						}
+						renderedPartMap["text"] = renderedText
+					}
+					// Render image_url.url if present
+					if imgURL, ok := partMap["image_url"].(map[string]interface{}); ok {
+						renderedImgURL := make(map[string]interface{})
+						for k, v := range imgURL {
+							renderedImgURL[k] = v
+						}
+						if url, ok := imgURL["url"].(string); ok {
+							renderedURL, err := d.templateEngine.Render(url, vars)
+							if err != nil {
+								return fmt.Errorf("error rendering image URL: %w", err)
+							}
+							renderedImgURL["url"] = renderedURL
+						}
+						renderedPartMap["image_url"] = renderedImgURL
+					}
+					renderedParts[j] = renderedPartMap
+				} else {
+					renderedParts[j] = part
+				}
+			}
+			renderedMsg.Content = renderedParts
+		}
+
+		renderedMessages[i] = renderedMsg
+	}
+	rendered.Messages = renderedMessages
+	return nil
+}
+
+// renderStepSequential renders step templates sequentially (original implementation)
+func (d *StepDispatcher) renderStepSequential(step *core.Step, vars map[string]any) (*core.Step, error) {
+	// Create a copy of the step
+	rendered := *step
+
+	// Render command fields
+	if step.Command != "" {
+		cmd, err := d.templateEngine.Render(step.Command, vars)
+		if err != nil {
+			return nil, err
+		}
+		rendered.Command = cmd
+	}
+
+	if len(step.Commands) > 0 {
+		cmds, err := d.templateEngine.RenderSlice(step.Commands, vars)
+		if err != nil {
+			return nil, err
+		}
+		rendered.Commands = cmds
+	}
+
+	if len(step.ParallelCommands) > 0 {
+		cmds, err := d.templateEngine.RenderSlice(step.ParallelCommands, vars)
+		if err != nil {
+			return nil, err
+		}
+		rendered.ParallelCommands = cmds
+	}
+
+	// Render structured argument fields (for bash/remote-bash steps)
+	if step.SpeedArgs != "" {
+		args, err := d.templateEngine.Render(step.SpeedArgs, vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering speed_args: %w", err)
+		}
+		rendered.SpeedArgs = args
+	}
+	if step.ConfigArgs != "" {
+		args, err := d.templateEngine.Render(step.ConfigArgs, vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering config_args: %w", err)
+		}
+		rendered.ConfigArgs = args
+	}
+	if step.InputArgs != "" {
+		args, err := d.templateEngine.Render(step.InputArgs, vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering input_args: %w", err)
+		}
+		rendered.InputArgs = args
+	}
+	if step.OutputArgs != "" {
+		args, err := d.templateEngine.Render(step.OutputArgs, vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering output_args: %w", err)
+		}
+		rendered.OutputArgs = args
+	}
+
+	// Render std_file for stdout/stderr capture
+	if step.StdFile != "" {
+		stdFile, err := d.templateEngine.Render(step.StdFile, vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering std_file: %w", err)
+		}
+		rendered.StdFile = stdFile
+	}
+
+	// Render function fields
+	if step.Function != "" {
+		fn, err := d.templateEngine.Render(step.Function, vars)
+		if err != nil {
+			return nil, err
+		}
+		rendered.Function = fn
+	}
+
+	if len(step.Functions) > 0 {
+		fns, err := d.templateEngine.RenderSlice(step.Functions, vars)
+		if err != nil {
+			return nil, err
+		}
+		rendered.Functions = fns
+	}
+
+	if len(step.ParallelFunctions) > 0 {
+		fns, err := d.templateEngine.RenderSlice(step.ParallelFunctions, vars)
+		if err != nil {
+			return nil, err
+		}
+		rendered.ParallelFunctions = fns
+	}
+
+	// Render foreach fields
+	if step.Input != "" {
+		input, err := d.templateEngine.Render(step.Input, vars)
+		if err != nil {
+			return nil, err
+		}
+		rendered.Input = input
+	}
+	if step.VariablePreProcess != "" {
+		vpp, err := d.templateEngine.Render(step.VariablePreProcess, vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering variable_pre_process: %w", err)
+		}
+		rendered.VariablePreProcess = vpp
+	}
+
+	// Render log message
+	if step.Log != "" {
+		log, err := d.templateEngine.Render(step.Log, vars)
+		if err != nil {
+			return nil, err
+		}
+		rendered.Log = log
+	}
+
+	if step.Timeout != "" {
+		to, err := d.templateEngine.Render(string(step.Timeout), vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering timeout: %w", err)
+		}
+		rendered.Timeout = core.StepTimeout(to)
+	}
+
+	if step.Threads != "" {
+		th, err := d.templateEngine.Render(string(step.Threads), vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering threads: %w", err)
+		}
+		rendered.Threads = core.StepThreads(th)
+	}
+
+	// Render HTTP step fields
+	if step.URL != "" {
+		url, err := d.templateEngine.Render(step.URL, vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering url: %w", err)
+		}
+		rendered.URL = url
+	}
+	if step.Method != "" {
+		method, err := d.templateEngine.Render(step.Method, vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering method: %w", err)
+		}
+		rendered.Method = method
+	}
+	if step.RequestBody != "" {
+		body, err := d.templateEngine.Render(step.RequestBody, vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering request_body: %w", err)
+		}
+		rendered.RequestBody = body
+	}
+	if len(step.Headers) > 0 {
+		headers, err := d.templateEngine.RenderMap(step.Headers, vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering headers: %w", err)
+		}
+		rendered.Headers = headers
+	}
+
+	// Render step_runner if it contains template variables
+	if step.StepRunner != "" {
+		sr, err := d.templateEngine.Render(string(step.StepRunner), vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering step_runner: %w", err)
+		}
+		rendered.StepRunner = core.RunnerType(sr)
+	}
+
+	// Render step_runner_config fields for remote-bash steps
+	if step.StepRunnerConfig != nil {
+		renderedConfig := &core.StepRunnerConfig{}
+
+		if step.StepRunnerConfig.RunnerConfig != nil {
+			cfg := *step.StepRunnerConfig.RunnerConfig
+
+			// Render string fields that may contain templates
+			if cfg.Image != "" {
+				img, err := d.templateEngine.Render(cfg.Image, vars)
+				if err != nil {
+					return nil, fmt.Errorf("error rendering step_runner_config.image: %w", err)
+				}
+				cfg.Image = img
+			}
+			if cfg.Host != "" {
+				host, err := d.templateEngine.Render(cfg.Host, vars)
+				if err != nil {
+					return nil, fmt.Errorf("error rendering step_runner_config.host: %w", err)
+				}
+				cfg.Host = host
+			}
+			if cfg.User != "" {
+				user, err := d.templateEngine.Render(cfg.User, vars)
+				if err != nil {
+					return nil, fmt.Errorf("error rendering step_runner_config.user: %w", err)
+				}
+				cfg.User = user
+			}
+			if cfg.Password != "" {
+				pass, err := d.templateEngine.Render(cfg.Password, vars)
+				if err != nil {
+					return nil, fmt.Errorf("error rendering step_runner_config.password: %w", err)
+				}
+				cfg.Password = pass
+			}
+			if cfg.KeyFile != "" {
+				keyFile, err := d.templateEngine.Render(cfg.KeyFile, vars)
+				if err != nil {
+					return nil, fmt.Errorf("error rendering step_runner_config.key_file: %w", err)
+				}
+				cfg.KeyFile = keyFile
+			}
+			if cfg.WorkDir != "" {
+				workDir, err := d.templateEngine.Render(cfg.WorkDir, vars)
+				if err != nil {
+					return nil, fmt.Errorf("error rendering step_runner_config.workdir: %w", err)
+				}
+				cfg.WorkDir = workDir
+			}
+			if cfg.Network != "" {
+				network, err := d.templateEngine.Render(cfg.Network, vars)
+				if err != nil {
+					return nil, fmt.Errorf("error rendering step_runner_config.network: %w", err)
+				}
+				cfg.Network = network
+			}
+
+			// Render env map values
+			if len(cfg.Env) > 0 {
+				renderedEnv, err := d.templateEngine.RenderMap(cfg.Env, vars)
+				if err != nil {
+					return nil, fmt.Errorf("error rendering step_runner_config.env: %w", err)
+				}
+				cfg.Env = renderedEnv
+			}
+
+			// Render volumes slice
+			if len(cfg.Volumes) > 0 {
+				renderedVols, err := d.templateEngine.RenderSlice(cfg.Volumes, vars)
+				if err != nil {
+					return nil, fmt.Errorf("error rendering step_runner_config.volumes: %w", err)
+				}
+				cfg.Volumes = renderedVols
+			}
+
+			renderedConfig.RunnerConfig = &cfg
+		}
+
+		rendered.StepRunnerConfig = renderedConfig
+	}
+
+	// Render remote-bash file copy fields
+	if step.StepRemoteFile != "" {
+		remoteFile, err := d.templateEngine.Render(step.StepRemoteFile, vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering step_remote_file: %w", err)
+		}
+		rendered.StepRemoteFile = remoteFile
+	}
+	if step.HostOutputFile != "" {
+		hostFile, err := d.templateEngine.Render(step.HostOutputFile, vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering host_output_file: %w", err)
+		}
+		rendered.HostOutputFile = hostFile
+	}
+
+	// Render agent step fields
+	if step.Query != "" {
+		q, err := d.templateEngine.Render(step.Query, vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering query: %w", err)
+		}
+		rendered.Query = q
+	}
+	if len(step.Queries) > 0 {
+		qs, err := d.templateEngine.RenderSlice(step.Queries, vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering queries: %w", err)
+		}
+		rendered.Queries = qs
+	}
+	if step.SystemPrompt != "" {
+		sp, err := d.templateEngine.Render(step.SystemPrompt, vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering system_prompt: %w", err)
+		}
+		rendered.SystemPrompt = sp
+	}
+	if step.StopCondition != "" {
+		sc, err := d.templateEngine.Render(step.StopCondition, vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering stop_condition: %w", err)
+		}
+		rendered.StopCondition = sc
+	}
+	if step.PlanPrompt != "" {
+		pp, err := d.templateEngine.Render(step.PlanPrompt, vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering plan_prompt: %w", err)
+		}
+		rendered.PlanPrompt = pp
+	}
+	if step.OnToolStart != "" {
+		ots, err := d.templateEngine.Render(step.OnToolStart, vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering on_tool_start: %w", err)
+		}
+		rendered.OnToolStart = ots
+	}
+	if step.OnToolEnd != "" {
+		ote, err := d.templateEngine.Render(step.OnToolEnd, vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering on_tool_end: %w", err)
+		}
+		rendered.OnToolEnd = ote
+	}
+	if step.Memory != nil {
+		mem := *step.Memory
+		if mem.PersistPath != "" {
+			pp, err := d.templateEngine.Render(mem.PersistPath, vars)
+			if err != nil {
+				return nil, fmt.Errorf("error rendering memory.persist_path: %w", err)
+			}
+			mem.PersistPath = pp
+		}
+		if mem.ResumePath != "" {
+			rp, err := d.templateEngine.Render(mem.ResumePath, vars)
+			if err != nil {
+				return nil, fmt.Errorf("error rendering memory.resume_path: %w", err)
+			}
+			mem.ResumePath = rp
+		}
+		rendered.Memory = &mem
+	}
+
+	// Render agent tool handlers
+	if len(step.AgentTools) > 0 {
+		renderedTools := make([]core.AgentToolDef, len(step.AgentTools))
+		copy(renderedTools, step.AgentTools)
+		for i, tool := range renderedTools {
+			if tool.Handler != "" {
+				h, err := d.templateEngine.Render(tool.Handler, vars)
+				if err != nil {
+					return nil, fmt.Errorf("error rendering agent_tools[%d].handler: %w", i, err)
+				}
+				renderedTools[i].Handler = h
+			}
+		}
+		rendered.AgentTools = renderedTools
+	}
+
+	// Render sub-agent fields (only top-level; nested sub-agents rendered on spawn)
+	if len(step.SubAgents) > 0 {
+		renderedSAs := make([]core.SubAgentDef, len(step.SubAgents))
+		for i, sa := range step.SubAgents {
+			renderedSAs[i] = sa.DeepCopy()
+			if sa.SystemPrompt != "" {
+				sp, err := d.templateEngine.Render(sa.SystemPrompt, vars)
+				if err != nil {
+					return nil, fmt.Errorf("error rendering sub_agents[%d].system_prompt: %w", i, err)
+				}
+				renderedSAs[i].SystemPrompt = sp
+			}
+			if sa.StopCondition != "" {
+				sc, err := d.templateEngine.Render(sa.StopCondition, vars)
+				if err != nil {
+					return nil, fmt.Errorf("error rendering sub_agents[%d].stop_condition: %w", i, err)
+				}
+				renderedSAs[i].StopCondition = sc
+			}
+			if sa.OnToolStart != "" {
+				ots, err := d.templateEngine.Render(sa.OnToolStart, vars)
+				if err != nil {
+					return nil, fmt.Errorf("error rendering sub_agents[%d].on_tool_start: %w", i, err)
+				}
+				renderedSAs[i].OnToolStart = ots
+			}
+			if sa.OnToolEnd != "" {
+				ote, err := d.templateEngine.Render(sa.OnToolEnd, vars)
+				if err != nil {
+					return nil, fmt.Errorf("error rendering sub_agents[%d].on_tool_end: %w", i, err)
+				}
+				renderedSAs[i].OnToolEnd = ote
+			}
+			if sa.Memory != nil {
+				if renderedSAs[i].Memory == nil {
+					mem := *sa.Memory
+					renderedSAs[i].Memory = &mem
+				}
+				if sa.Memory.PersistPath != "" {
+					pp, err := d.templateEngine.Render(sa.Memory.PersistPath, vars)
+					if err != nil {
+						return nil, fmt.Errorf("error rendering sub_agents[%d].memory.persist_path: %w", i, err)
+					}
+					renderedSAs[i].Memory.PersistPath = pp
+				}
+				if sa.Memory.ResumePath != "" {
+					rp, err := d.templateEngine.Render(sa.Memory.ResumePath, vars)
+					if err != nil {
+						return nil, fmt.Errorf("error rendering sub_agents[%d].memory.resume_path: %w", i, err)
+					}
+					renderedSAs[i].Memory.ResumePath = rp
+				}
+			}
+			for j, tool := range sa.AgentTools {
+				if tool.Handler != "" {
+					h, err := d.templateEngine.Render(tool.Handler, vars)
+					if err != nil {
+						return nil, fmt.Errorf("error rendering sub_agents[%d].agent_tools[%d].handler: %w", i, j, err)
+					}
+					renderedSAs[i].AgentTools[j].Handler = h
+				}
+			}
+		}
+		rendered.SubAgents = renderedSAs
+	}
+
+	// Render agent-acp step fields
+	if step.Agent != "" {
+		agent, err := d.templateEngine.Render(step.Agent, vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering agent: %w", err)
+		}
+		rendered.Agent = agent
+	}
+	if step.Cwd != "" {
+		cwd, err := d.templateEngine.Render(step.Cwd, vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering cwd: %w", err)
+		}
+		rendered.Cwd = cwd
+	}
+	if len(step.AllowedPaths) > 0 {
+		paths, err := d.templateEngine.RenderSlice(step.AllowedPaths, vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering allowed_paths: %w", err)
+		}
+		rendered.AllowedPaths = paths
+	}
+	if step.ACPConfig != nil {
+		cfg := *step.ACPConfig
+		if cfg.Command != "" {
+			cmd, err := d.templateEngine.Render(cfg.Command, vars)
+			if err != nil {
+				return nil, fmt.Errorf("error rendering acp_config.command: %w", err)
+			}
+			cfg.Command = cmd
+		}
+		if len(cfg.Args) > 0 {
+			args, err := d.templateEngine.RenderSlice(cfg.Args, vars)
+			if err != nil {
+				return nil, fmt.Errorf("error rendering acp_config.args: %w", err)
+			}
+			cfg.Args = args
+		}
+		if len(cfg.Env) > 0 {
+			env, err := d.templateEngine.RenderMap(cfg.Env, vars)
+			if err != nil {
+				return nil, fmt.Errorf("error rendering acp_config.env: %w", err)
+			}
+			cfg.Env = env
+		}
+		rendered.ACPConfig = &cfg
+	}
+
+	// Render LLM step fields
+	if len(step.Messages) > 0 {
+		if err := d.renderLLMMessages(&rendered, vars); err != nil {
+			return nil, err
+		}
+	}
+
+	// Render embedding input
+	if len(step.EmbeddingInput) > 0 {
+		embInputs, err := d.templateEngine.RenderSlice(step.EmbeddingInput, vars)
+		if err != nil {
+			return nil, fmt.Errorf("error rendering embedding_input: %w", err)
+		}
+		rendered.EmbeddingInput = embInputs
+	}
+
+	return &rendered, nil
+}
+
+// GetFunctionRegistry returns the function registry
+func (d *StepDispatcher) GetFunctionRegistry() *functions.Registry {
+	return d.functionRegistry
+}
+
+// GetTemplateEngine returns the template engine
+func (d *StepDispatcher) GetTemplateEngine() template.TemplateEngine {
+	return d.templateEngine
+}

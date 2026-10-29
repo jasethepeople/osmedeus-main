@@ -1,0 +1,622 @@
+package core
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type StepTimeout string
+
+func (t *StepTimeout) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var i int
+	if err := unmarshal(&i); err == nil {
+		if i < 0 {
+			i = 0
+		}
+		*t = StepTimeout(strconv.Itoa(i))
+		return nil
+	}
+
+	var s string
+	if err := unmarshal(&s); err == nil {
+		*t = StepTimeout(strings.TrimSpace(s))
+		return nil
+	}
+
+	return fmt.Errorf("invalid timeout")
+}
+
+func (t StepTimeout) MarshalYAML() (interface{}, error) {
+	s := strings.TrimSpace(string(t))
+	if s == "" {
+		return nil, nil
+	}
+
+	if isDigits(s) {
+		i, err := strconv.Atoi(s)
+		if err != nil {
+			return s, nil
+		}
+		return i, nil
+	}
+
+	return s, nil
+}
+
+func (t StepTimeout) Duration() (time.Duration, error) {
+	s := strings.TrimSpace(string(t))
+	if s == "" {
+		return 0, nil
+	}
+
+	if isDigits(s) {
+		i, err := strconv.Atoi(s)
+		if err != nil {
+			return 0, fmt.Errorf("invalid timeout: %w", err)
+		}
+		if i <= 0 {
+			return 0, nil
+		}
+		return time.Duration(i) * time.Second, nil
+	}
+
+	if strings.HasSuffix(s, "d") {
+		daysStr := strings.TrimSuffix(s, "d")
+		if !isDigits(daysStr) {
+			return 0, fmt.Errorf("invalid timeout: %s", s)
+		}
+		days, err := strconv.Atoi(daysStr)
+		if err != nil {
+			return 0, fmt.Errorf("invalid timeout: %w", err)
+		}
+		if days <= 0 {
+			return 0, nil
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid timeout: %w", err)
+	}
+	if d <= 0 {
+		return 0, nil
+	}
+	return d, nil
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+type StepThreads string
+
+func (t *StepThreads) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var i int
+	if err := unmarshal(&i); err == nil {
+		if i < 0 {
+			i = 0
+		}
+		*t = StepThreads(strconv.Itoa(i))
+		return nil
+	}
+
+	var s string
+	if err := unmarshal(&s); err == nil {
+		*t = StepThreads(strings.TrimSpace(s))
+		return nil
+	}
+
+	return fmt.Errorf("invalid threads")
+}
+
+func (t StepThreads) MarshalYAML() (interface{}, error) {
+	s := strings.TrimSpace(string(t))
+	if s == "" {
+		return nil, nil
+	}
+
+	if isDigits(s) {
+		i, err := strconv.Atoi(s)
+		if err != nil {
+			return s, nil
+		}
+		return i, nil
+	}
+
+	return s, nil
+}
+
+func (t StepThreads) Int() (int, error) {
+	s := strings.TrimSpace(string(t))
+	if s == "" {
+		return 0, nil
+	}
+
+	i, err := strconv.Atoi(s)
+	if err == nil {
+		if i <= 0 {
+			return 0, nil
+		}
+		return i, nil
+	}
+
+	f, ferr := strconv.ParseFloat(s, 64)
+	if ferr != nil {
+		return 0, fmt.Errorf("invalid threads: %w", err)
+	}
+
+	if f <= 0 {
+		return 0, nil
+	}
+
+	if f != float64(int(f)) {
+		return 0, fmt.Errorf("invalid threads: %s", s)
+	}
+
+	return int(f), nil
+}
+
+// StepRunnerConfig holds per-step runner configuration for remote-bash steps
+// The runner type is specified separately in Step.StepRunner
+type StepRunnerConfig struct {
+	*RunnerConfig `yaml:",inline"` // Embed all RunnerConfig fields (image, host, etc.)
+}
+
+// Step represents a single execution step in a module
+type Step struct {
+	Name         string      `yaml:"name"`
+	Type         StepType    `yaml:"type"`
+	DependsOn    []string    `yaml:"depends_on,omitempty"` // Step dependencies for DAG execution
+	StepRunner   RunnerType  `yaml:"step_runner"`          // Runner for this step: local (default), docker, ssh
+	PreCondition string      `yaml:"pre_condition"`
+	Log          string      `yaml:"log"`
+	Timeout      StepTimeout `yaml:"timeout,omitempty"`
+
+	// Bash step fields
+	Command          string   `yaml:"command"`
+	Commands         []string `yaml:"commands"`
+	ParallelCommands []string `yaml:"parallel_commands"`
+	StdFile          string   `yaml:"std_file"` // File path to save stdout/stderr output
+
+	// Structured argument fields (for bash/remote-bash steps)
+	// These are templated and joined with Command in order: command + speed + config + input + output
+	SpeedArgs  string `yaml:"speed_args"`
+	ConfigArgs string `yaml:"config_args"`
+	InputArgs  string `yaml:"input_args"`
+	OutputArgs string `yaml:"output_args"`
+
+	// Function step fields
+	Function          string   `yaml:"function"`
+	Functions         []string `yaml:"functions"`
+	ParallelFunctions []string `yaml:"parallel_functions"`
+
+	// Parallel step fields
+	ParallelSteps []Step `yaml:"parallel_steps"`
+
+	// Foreach step fields
+	Input              string      `yaml:"input"`
+	Variable           string      `yaml:"variable"`
+	VariablePreProcess string      `yaml:"variable_pre_process,omitempty"` // Transform each input line before storing in variable
+	Threads            StepThreads `yaml:"threads,omitempty"`
+	Step               *Step       `yaml:"step"`
+
+	// Remote-bash step fields
+	StepRunnerConfig *StepRunnerConfig `yaml:"step_runner_config"`
+	StepRemoteFile   string            `yaml:"step_remote_file"` // File path on remote (Docker/SSH) to copy after execution
+	HostOutputFile   string            `yaml:"host_output_file"` // Local path to copy the remote file to
+
+	// HTTP step fields
+	URL         string            `yaml:"url"`
+	Method      string            `yaml:"method"`
+	Headers     map[string]string `yaml:"headers"`
+	RequestBody string            `yaml:"request_body"`
+
+	// LLM step fields
+	Messages       []LLMMessage           `yaml:"messages"`
+	Tools          []LLMTool              `yaml:"tools,omitempty"`
+	ToolChoice     interface{}            `yaml:"tool_choice,omitempty"`
+	LLMConfig      *LLMStepConfig         `yaml:"llm_config,omitempty"`
+	IsEmbedding    bool                   `yaml:"is_embedding,omitempty"`
+	EmbeddingInput []string               `yaml:"embedding_input,omitempty"`
+	ExtraLLMParams map[string]interface{} `yaml:"extra_llm_parameters,omitempty"`
+
+	// Agent step fields
+	Query             string             `yaml:"query,omitempty"`
+	Queries           []string           `yaml:"queries,omitempty"` // Multiple queries executed sequentially (multi-goal)
+	SystemPrompt      string             `yaml:"system_prompt,omitempty"`
+	AgentTools        []AgentToolDef     `yaml:"agent_tools,omitempty"`
+	ParallelToolCalls *bool              `yaml:"parallel_tool_calls,omitempty"`
+	MaxIterations     int                `yaml:"max_iterations,omitempty"`
+	StopCondition     string             `yaml:"stop_condition,omitempty"`
+	Memory            *AgentMemoryConfig `yaml:"memory,omitempty"`
+
+	// Agent planning stage
+	PlanPrompt    string `yaml:"plan_prompt,omitempty"`
+	PlanMaxTokens *int   `yaml:"plan_max_tokens,omitempty"`
+
+	// Agent model preferences (tried in order before falling back to default)
+	Models []string `yaml:"models,omitempty"`
+
+	// Agent structured output (enforced on final iteration)
+	// JSON string, e.g. '{"type":"object","properties":{"key":{"type":"string"}}}'
+	OutputSchema string `yaml:"output_schema,omitempty"`
+
+	// Agent tool tracing hooks (JS expressions)
+	OnToolStart string `yaml:"on_tool_start,omitempty"` // Evaluated before each tool call
+	OnToolEnd   string `yaml:"on_tool_end,omitempty"`   // Evaluated after each tool call
+
+	// Sub-agents that can be spawned by this agent via tool calls
+	SubAgents []SubAgentDef `yaml:"sub_agents,omitempty"`
+	// Maximum nesting depth for sub-agent spawning (default: 3)
+	MaxAgentDepth int `yaml:"max_agent_depth,omitempty"`
+
+	// Agent-ACP step fields
+	Agent        string         `yaml:"agent,omitempty"`         // Built-in agent name (e.g., "claude-code", "codex")
+	Cwd          string         `yaml:"cwd,omitempty"`           // Working directory for ACP session
+	AllowedPaths []string       `yaml:"allowed_paths,omitempty"` // Paths the agent is allowed to read
+	ACPConfig    *ACPStepConfig `yaml:"acp_config,omitempty"`    // ACP-specific configuration
+
+	// Agent-SDK step fields (uses go-agent-agnostic library)
+	SDKConfig *SDKStepConfig `yaml:"sdk_config,omitempty"` // SDK-specific configuration
+
+	// Streaming (applies to both llm and agent steps)
+	Stream *bool `yaml:"stream,omitempty"` // Enable streaming output (overrides llm_config.stream and global config)
+
+	// Common fields
+	SuppressDetails bool              `yaml:"suppress_details"` // Hide command/function details from output
+	Exports         map[string]string `yaml:"exports"`
+	OnSuccess       []Action          `yaml:"on_success"`
+	OnError         []Action          `yaml:"on_error"`
+	Decision        *DecisionConfig   `yaml:"decision,omitempty"`
+}
+
+// DecisionCase represents a single case in switch-style decision
+type DecisionCase struct {
+	Goto      string   `yaml:"goto,omitempty"`
+	Command   string   `yaml:"command,omitempty"`
+	Commands  []string `yaml:"commands,omitempty"`
+	Function  string   `yaml:"function,omitempty"`
+	Functions []string `yaml:"functions,omitempty"`
+}
+
+// HasInlineExecution returns true if the case has inline command or function execution
+func (dc *DecisionCase) HasInlineExecution() bool {
+	return dc.Command != "" || len(dc.Commands) > 0 || dc.Function != "" || len(dc.Functions) > 0
+}
+
+// DecisionCondition represents a condition-based decision entry evaluated via JS expressions.
+// Unlike switch/cases (exact string matching), conditions support boolean logic.
+// All matching conditions execute (no short-circuit).
+type DecisionCondition struct {
+	If        string   `yaml:"if"`
+	Goto      string   `yaml:"goto,omitempty"`
+	Command   string   `yaml:"command,omitempty"`
+	Commands  []string `yaml:"commands,omitempty"`
+	Function  string   `yaml:"function,omitempty"`
+	Functions []string `yaml:"functions,omitempty"`
+}
+
+// HasInlineExecution returns true if the condition has inline command or function execution
+func (dc *DecisionCondition) HasInlineExecution() bool {
+	return dc.Command != "" || len(dc.Commands) > 0 || dc.Function != "" || len(dc.Functions) > 0
+}
+
+// DecisionConfig supports switch/case routing for conditional workflow branching,
+// and condition-based routing with JS boolean expressions.
+//
+// Switch/case syntax:
+//
+//	decision:
+//	  switch: "{{variable}}"
+//	  cases:
+//	    "value1": { goto: step-a }
+//	    "value2": { goto: step-b }
+//	  default:
+//	    goto: fallback-step
+//
+// Conditions syntax:
+//
+//	decision:
+//	  conditions:
+//	    - if: "file_length('{{inputFile}}')"
+//	      function: "log_info('file has content')"
+//	    - if: "{{enableNmap}} && contains('{{Port}}', '-')"
+//	      function: "log_info('long scan mode detected')"
+type DecisionConfig struct {
+	Switch     string                  `yaml:"switch,omitempty"`
+	Cases      map[string]DecisionCase `yaml:"cases,omitempty"`
+	Default    *DecisionCase           `yaml:"default,omitempty"`
+	Conditions []DecisionCondition     `yaml:"conditions,omitempty"`
+}
+
+// Action represents on_success/on_error handler
+type Action struct {
+	Action    ActionType        `yaml:"action"`
+	Message   string            `yaml:"message"`
+	Condition string            `yaml:"condition"`
+	Name      string            `yaml:"name"`      // for export action
+	Value     interface{}       `yaml:"value"`     // for export action
+	Type      StepType          `yaml:"type"`      // for run action
+	Command   string            `yaml:"command"`   // for run bash action
+	Functions []string          `yaml:"functions"` // for run function action
+	Export    map[string]string `yaml:"export"`    // for run function action
+	Notify    string            `yaml:"notify"`    // notification message
+}
+
+// ACPStepConfig holds configuration specific to agent-acp steps
+type ACPStepConfig struct {
+	Command      string            `yaml:"command,omitempty"`       // Custom agent command (overrides built-in registry)
+	Args         []string          `yaml:"args,omitempty"`          // Custom agent command arguments
+	Env          map[string]string `yaml:"env,omitempty"`           // Environment variables for the agent process
+	WriteEnabled bool              `yaml:"write_enabled,omitempty"` // Allow the agent to write files (default: false)
+}
+
+// SDKStepConfig holds configuration specific to agent-sdk steps
+type SDKStepConfig struct {
+	Model          string            `yaml:"model,omitempty"`           // Model name (agent-specific, e.g., "sonnet", "o3")
+	Env            map[string]string `yaml:"env,omitempty"`             // Environment variables for the agent process
+	MaxTurns       int               `yaml:"max_turns,omitempty"`       // Max agentic turns (claude-code only, 0 = default)
+	PermissionMode string            `yaml:"permission_mode,omitempty"` // Permission mode (claude-code only, e.g., "bypassPermissions")
+	Sandbox        string            `yaml:"sandbox,omitempty"`         // Sandbox mode (codex only, e.g., "danger-full-access")
+	Strategy       string            `yaml:"strategy,omitempty"`        // Multi-agent strategy: "first" or "all" (requires agents list)
+	Agents         []string          `yaml:"agents,omitempty"`          // Multiple agents for multi-agent strategies
+	SessionResume  string            `yaml:"session_resume,omitempty"`  // Resume a previous session by ID (claude-code only)
+}
+
+// IsBashStep returns true if this is a bash step
+func (s *Step) IsBashStep() bool {
+	return s.Type == StepTypeBash
+}
+
+// IsFunctionStep returns true if this is a function step
+func (s *Step) IsFunctionStep() bool {
+	return s.Type == StepTypeFunction
+}
+
+// IsParallelStep returns true if this is a parallel step
+func (s *Step) IsParallelStep() bool {
+	return s.Type == StepTypeParallel
+}
+
+// IsForeachStep returns true if this is a foreach step
+func (s *Step) IsForeachStep() bool {
+	return s.Type == StepTypeForeach
+}
+
+// IsRemoteBashStep returns true if this is a remote-bash step
+func (s *Step) IsRemoteBashStep() bool {
+	return s.Type == StepTypeRemoteBash
+}
+
+// IsHTTPStep returns true if this is an HTTP step
+func (s *Step) IsHTTPStep() bool {
+	return s.Type == StepTypeHTTP
+}
+
+// IsLLMStep returns true if this is an LLM step
+func (s *Step) IsLLMStep() bool {
+	return s.Type == StepTypeLLM
+}
+
+// IsAgentStep returns true if this is an agent step
+func (s *Step) IsAgentStep() bool {
+	return s.Type == StepTypeAgent
+}
+
+// IsAgentACPStep returns true if this is an agent-acp step
+func (s *Step) IsAgentACPStep() bool {
+	return s.Type == StepTypeAgentACP
+}
+
+// IsAgentSDKStep returns true if this is an agent-sdk step
+func (s *Step) IsAgentSDKStep() bool {
+	return s.Type == StepTypeAgentSDK
+}
+
+// GetStepRunner returns the step runner type, defaulting to host/local
+func (s *Step) GetStepRunner() RunnerType {
+	if s.StepRunner == "" {
+		return RunnerTypeHost // default to local
+	}
+	return s.StepRunner
+}
+
+// HasParallelCommands returns true if step has parallel commands
+func (s *Step) HasParallelCommands() bool {
+	return len(s.ParallelCommands) > 0
+}
+
+// HasParallelFunctions returns true if step has parallel functions
+func (s *Step) HasParallelFunctions() bool {
+	return len(s.ParallelFunctions) > 0
+}
+
+// HasDecision returns true if step has decision routing
+func (s *Step) HasDecision() bool {
+	if s.Decision == nil {
+		return false
+	}
+	return s.Decision.Switch != "" || len(s.Decision.Cases) > 0 || len(s.Decision.Conditions) > 0
+}
+
+// HasExports returns true if step exports variables
+func (s *Step) HasExports() bool {
+	return len(s.Exports) > 0
+}
+
+// HasDependencies returns true if step has depends_on defined
+func (s *Step) HasDependencies() bool {
+	return len(s.DependsOn) > 0
+}
+
+// GetCommands returns the list of commands to execute
+// Returns single command as slice if Commands is empty
+func (s *Step) GetCommands() []string {
+	if len(s.Commands) > 0 {
+		return s.Commands
+	}
+	if s.Command != "" {
+		return []string{s.Command}
+	}
+	return nil
+}
+
+// GetFunctions returns the list of functions to execute
+// Returns single function as slice if Functions is empty
+func (s *Step) GetFunctions() []string {
+	if len(s.Functions) > 0 {
+		return s.Functions
+	}
+	if s.Function != "" {
+		return []string{s.Function}
+	}
+	return nil
+}
+
+// Clone creates a shallow copy of the step with new slices for Commands
+func (s *Step) Clone() *Step {
+	cloned := *s
+
+	// Deep copy slices to avoid modifying originals
+	if len(s.Commands) > 0 {
+		cloned.Commands = make([]string, len(s.Commands))
+		copy(cloned.Commands, s.Commands)
+	}
+	if len(s.ParallelCommands) > 0 {
+		cloned.ParallelCommands = make([]string, len(s.ParallelCommands))
+		copy(cloned.ParallelCommands, s.ParallelCommands)
+	}
+	if len(s.Functions) > 0 {
+		cloned.Functions = make([]string, len(s.Functions))
+		copy(cloned.Functions, s.Functions)
+	}
+	if len(s.ParallelFunctions) > 0 {
+		cloned.ParallelFunctions = make([]string, len(s.ParallelFunctions))
+		copy(cloned.ParallelFunctions, s.ParallelFunctions)
+	}
+
+	// Deep copy StepRunnerConfig
+	if s.StepRunnerConfig != nil {
+		clonedConfig := &StepRunnerConfig{}
+		if s.StepRunnerConfig.RunnerConfig != nil {
+			cfg := *s.StepRunnerConfig.RunnerConfig
+			// Deep copy slices in RunnerConfig
+			if len(cfg.Volumes) > 0 {
+				cfg.Volumes = make([]string, len(s.StepRunnerConfig.Volumes))
+				copy(cfg.Volumes, s.StepRunnerConfig.Volumes)
+			}
+			if len(cfg.Env) > 0 {
+				cfg.Env = make(map[string]string, len(s.StepRunnerConfig.Env))
+				for k, v := range s.StepRunnerConfig.Env {
+					cfg.Env[k] = v
+				}
+			}
+			clonedConfig.RunnerConfig = &cfg
+		}
+		cloned.StepRunnerConfig = clonedConfig
+	}
+
+	// Deep copy HTTP Headers map
+	if len(s.Headers) > 0 {
+		cloned.Headers = make(map[string]string, len(s.Headers))
+		for k, v := range s.Headers {
+			cloned.Headers[k] = v
+		}
+	}
+
+	// Deep copy LLM fields
+	if len(s.Messages) > 0 {
+		cloned.Messages = make([]LLMMessage, len(s.Messages))
+		copy(cloned.Messages, s.Messages)
+	}
+	if len(s.Tools) > 0 {
+		cloned.Tools = make([]LLMTool, len(s.Tools))
+		copy(cloned.Tools, s.Tools)
+	}
+	if len(s.EmbeddingInput) > 0 {
+		cloned.EmbeddingInput = make([]string, len(s.EmbeddingInput))
+		copy(cloned.EmbeddingInput, s.EmbeddingInput)
+	}
+	if len(s.ExtraLLMParams) > 0 {
+		cloned.ExtraLLMParams = make(map[string]interface{}, len(s.ExtraLLMParams))
+		for k, v := range s.ExtraLLMParams {
+			cloned.ExtraLLMParams[k] = v
+		}
+	}
+
+	// Deep copy Agent fields
+	if len(s.AgentTools) > 0 {
+		cloned.AgentTools = make([]AgentToolDef, len(s.AgentTools))
+		copy(cloned.AgentTools, s.AgentTools)
+	}
+	if s.Memory != nil {
+		mem := *s.Memory
+		cloned.Memory = &mem
+	}
+	if len(s.Queries) > 0 {
+		cloned.Queries = make([]string, len(s.Queries))
+		copy(cloned.Queries, s.Queries)
+	}
+	if len(s.Models) > 0 {
+		cloned.Models = make([]string, len(s.Models))
+		copy(cloned.Models, s.Models)
+	}
+
+	// Deep copy Agent-ACP fields
+	if len(s.AllowedPaths) > 0 {
+		cloned.AllowedPaths = make([]string, len(s.AllowedPaths))
+		copy(cloned.AllowedPaths, s.AllowedPaths)
+	}
+	if s.ACPConfig != nil {
+		cfg := *s.ACPConfig
+		if len(s.ACPConfig.Args) > 0 {
+			cfg.Args = make([]string, len(s.ACPConfig.Args))
+			copy(cfg.Args, s.ACPConfig.Args)
+		}
+		if len(s.ACPConfig.Env) > 0 {
+			cfg.Env = make(map[string]string, len(s.ACPConfig.Env))
+			for k, v := range s.ACPConfig.Env {
+				cfg.Env[k] = v
+			}
+		}
+		cloned.ACPConfig = &cfg
+	}
+
+	// Deep copy Agent-SDK fields
+	if s.SDKConfig != nil {
+		cfg := *s.SDKConfig
+		if len(s.SDKConfig.Env) > 0 {
+			cfg.Env = make(map[string]string, len(s.SDKConfig.Env))
+			for k, v := range s.SDKConfig.Env {
+				cfg.Env[k] = v
+			}
+		}
+		if len(s.SDKConfig.Agents) > 0 {
+			cfg.Agents = make([]string, len(s.SDKConfig.Agents))
+			copy(cfg.Agents, s.SDKConfig.Agents)
+		}
+		cloned.SDKConfig = &cfg
+	}
+
+	// Deep copy SubAgents
+	if len(s.SubAgents) > 0 {
+		cloned.SubAgents = make([]SubAgentDef, len(s.SubAgents))
+		for i, sa := range s.SubAgents {
+			cloned.SubAgents[i] = sa.DeepCopy()
+		}
+	}
+
+	return &cloned
+}

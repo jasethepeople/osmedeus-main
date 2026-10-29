@@ -1,0 +1,1044 @@
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/signal"
+	"sort"
+	"strings"
+	"syscall"
+	"time"
+
+	"golang.org/x/term"
+
+	"github.com/j3ssie/osmedeus/v5/internal/config"
+	"github.com/j3ssie/osmedeus/v5/internal/database"
+	"github.com/j3ssie/osmedeus/v5/internal/terminal"
+	"github.com/olekukonko/tablewriter"
+	"github.com/olekukonko/tablewriter/renderer"
+	"github.com/olekukonko/tablewriter/tw"
+	"github.com/spf13/cobra"
+)
+
+var (
+	dbTable          string
+	dbOffset         int
+	dbLimit          int
+	dbNoTUI          bool
+	dbWhere          []string
+	dbColumns        string
+	dbSearch         string
+	dbAll            bool
+	dbIndexForce     bool
+	dbListColumns    bool
+	dbExcludeColumns string
+	dbRefresh        string
+	dbClear          bool
+	dbListTables     bool
+	dbIncludeHeavy   bool
+	dbCleanWS        bool
+)
+
+// defaultHiddenColumns are columns hidden by default for all tables
+var defaultHiddenColumns = []string{"id", "created_at", "updated_at", "completed_at"}
+
+// tableDefaultColumns defines default columns for specific tables
+var tableDefaultColumns = map[string][]string{
+	"runs":            {"run_uuid", "workflow_name", "target", "workspace", "trigger_type", "status", "completed_steps", "total_steps"},
+	"step_results":    {"step_name", "step_type", "status", "duration_ms", "command"},
+	"artifacts":       {"name", "path", "type", "size_bytes", "line_count"},
+	"assets":          {"asset_value", "status_code", "title", "tech", "host_ip", "source", "asset_type"},
+	"event_logs":      {"topic", "source", "processed", "data_type", "workspace", "data"},
+	"schedules":       {"name", "workflow_name", "workflow_kind", "target", "trigger_type", "schedule", "is_enabled", "run_count"},
+	"workspaces":      {"name", "data_source", "total_assets", "total_ips", "total_vulns", "risk_score"},
+	"vulnerabilities": {"vuln_title", "severity", "confidence", "asset_value", "last_seen_at", "workspace"},
+}
+
+// tableColumnMinWidths defines per-column minimum widths for specific tables (column_name → min_width)
+var tableColumnMinWidths = map[string]map[string]int{
+	"schedules": {
+		"name":     30,
+		"schedule": 20,
+	},
+	"assets": {
+		"title": 30,
+	},
+}
+
+// tableColumnWeights defines per-column weights for surplus width distribution (default weight = 1)
+var tableColumnWeights = map[string]map[string]int{
+	"assets": {
+		"asset_value": 8,
+		"title":       3,
+		"tech":        3,
+		"host_ip":     2,
+	},
+}
+
+// tableColumnDisplayNames maps internal column names to shorter display names
+var tableColumnDisplayNames = map[string]map[string]string{
+	"assets": {
+		"status_code": "status",
+	},
+}
+
+// dbCmd - parent command for database management
+var dbCmd = &cobra.Command{
+	Use:   "db",
+	Short: "Database management commands",
+	Long:  UsageDB(),
+	RunE:  runDBList,
+}
+
+// dbSeedCmd - seed database with sample data
+var dbSeedCmd = &cobra.Command{
+	Use:   "seed",
+	Short: "Seed database with sample data",
+	Long:  UsageDBSeed(),
+	RunE:  runDBSeed,
+}
+
+// dbCleanCmd - clean all data from database
+var dbCleanCmd = &cobra.Command{
+	Use:   "clean",
+	Short: "Remove all data from database",
+	Long:  UsageDBClean(),
+	RunE:  runDBClean,
+}
+
+// dbMigrateCmd - run database migrations
+var dbMigrateCmd = &cobra.Command{
+	Use:   "migrate",
+	Short: "Run database migrations",
+	Long:  UsageDBMigrate(),
+	RunE:  runDBMigrate,
+}
+
+// dbListCmd - list database tables
+var dbListCmd = &cobra.Command{
+	Use:     "list",
+	Aliases: []string{"ls"},
+	Short:   "List database tables and row counts",
+	Long:    UsageDBList(),
+	RunE:    runDBList,
+}
+
+// dbIndexCmd - parent command for indexing resources
+var dbIndexCmd = &cobra.Command{
+	Use:   "index",
+	Short: "Index resources from filesystem to database",
+	Long:  `Index resources from the filesystem into the database for faster querying.`,
+}
+
+// dbIndexWorkflowCmd - index workflows from filesystem
+var dbIndexWorkflowCmd = &cobra.Command{
+	Use:   "workflow",
+	Short: "Index workflows from filesystem to database",
+	Long: `Scan the workflows directory and index all workflows into the database.
+This enables faster workflow listing and filtering by tags, kind, etc.
+
+The command will:
+- Add new workflows found on disk
+- Update workflows that have changed (checksum mismatch)
+- Remove workflows from DB that no longer exist on disk
+
+Use --force to re-index all workflows regardless of checksum.`,
+	RunE: runIndexWorkflows,
+}
+
+func init() {
+	// Note: --force flag is now global (defined in root.go)
+
+	// Use persistent flags on dbCmd so they work on both `db` and `db ls`
+	dbCmd.PersistentFlags().StringVarP(&dbTable, "table", "t", "", "table name to list records from (runs, step_results, artifacts, assets, event_logs, schedules, workspaces)")
+	dbCmd.PersistentFlags().IntVar(&dbOffset, "offset", 0, "number of records to skip (for pagination)")
+	dbCmd.PersistentFlags().IntVar(&dbLimit, "limit", 50, "maximum number of records to return")
+	// Note: --json and --width flags are now global (defined in root.go)
+	dbCmd.PersistentFlags().BoolVar(&dbNoTUI, "no-tui", false, "disable interactive TUI mode, use plain text output")
+	dbCmd.PersistentFlags().StringArrayVar(&dbWhere, "where", nil, "filter records (key=value format, can be repeated) - only with --no-tui")
+	dbCmd.PersistentFlags().StringVar(&dbColumns, "columns", "", "comma-separated columns to display (default: all) - only with --no-tui")
+	dbCmd.PersistentFlags().StringVar(&dbSearch, "search", "", "search all columns for substring (case-insensitive) - only with --no-tui")
+	dbCmd.PersistentFlags().BoolVar(&dbAll, "all", false, "show all columns including hidden ones (id, timestamps) - only with --no-tui")
+	dbCmd.PersistentFlags().BoolVar(&dbListColumns, "list-columns", false, "list all available columns for the specified table")
+	dbCmd.PersistentFlags().StringVar(&dbExcludeColumns, "exclude-columns", "", "comma-separated column names to exclude from output")
+	dbCmd.PersistentFlags().StringVar(&dbRefresh, "refresh", "", "auto-refresh interval (e.g., 5s, 1m, 30s)")
+	dbCmd.PersistentFlags().BoolVar(&dbListTables, "list", false, "list all available table names")
+	dbCmd.PersistentFlags().BoolVar(&dbClear, "clear", false, "clear all records from the specified table (requires --table and --force)")
+	dbCmd.PersistentFlags().BoolVar(&dbIncludeHeavy, "include-heavy", false, "include large fields (raw_response, screenshot, blob_content) in output")
+
+	dbCleanCmd.Flags().BoolVar(&dbCleanWS, "clean-ws", false, "also remove workspace data directory (e.g. ~/workspaces-osmedeus)")
+
+	dbIndexWorkflowCmd.Flags().BoolVar(&dbIndexForce, "force", false, "force re-index all workflows regardless of checksum")
+
+	dbIndexCmd.AddCommand(dbIndexWorkflowCmd)
+
+	dbCmd.AddCommand(dbSeedCmd)
+	dbCmd.AddCommand(dbCleanCmd)
+	dbCmd.AddCommand(dbMigrateCmd)
+	dbCmd.AddCommand(dbListCmd)
+	dbCmd.AddCommand(dbIndexCmd)
+}
+
+// runDBSeed seeds the database with sample data
+func runDBSeed(cmd *cobra.Command, args []string) error {
+	if disableDB {
+		return fmt.Errorf("database commands unavailable: --disable-db flag is set")
+	}
+
+	printer := terminal.NewPrinter()
+	cfg := config.Get()
+
+	if cfg == nil {
+		return fmt.Errorf("configuration not loaded")
+	}
+
+	printer.Info("Connecting to database...")
+
+	// Connect to database
+	db, err := database.Connect(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	// Run migrations first to ensure tables exist
+	ctx := context.Background()
+	if err := database.Migrate(ctx); err != nil {
+		return fmt.Errorf("failed to run migrations: %w", err)
+	}
+
+	printer.Info("Seeding database with sample data...")
+
+	// Seed the database
+	if err := database.SeedDatabase(ctx); err != nil {
+		return fmt.Errorf("failed to seed database: %w", err)
+	}
+
+	printer.Success("Database seeded successfully")
+	printer.Info("Database: %s", getDatabaseInfo(cfg, db))
+
+	return nil
+}
+
+// runDBClean removes all data from the database
+func runDBClean(cmd *cobra.Command, args []string) error {
+	if disableDB {
+		return fmt.Errorf("database commands unavailable: --disable-db flag is set")
+	}
+
+	printer := terminal.NewPrinter()
+	cfg := config.Get()
+
+	if cfg == nil {
+		return fmt.Errorf("configuration not loaded")
+	}
+
+	if !globalForce {
+		printer.Warning("This will delete ALL data from the database!")
+		printer.Warning("Use --force to skip this confirmation")
+		return fmt.Errorf("operation aborted: use --force to confirm")
+	}
+
+	ctx := context.Background()
+
+	if cfg.IsSQLite() {
+		// SQLite: Delete the file and recreate
+		dbPath := cfg.GetDBPath()
+
+		// Close existing connection if any
+		_ = database.Close()
+
+		// Delete the database file
+		if err := os.Remove(dbPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed to delete database file: %w", err)
+		}
+		printer.Info("Deleted database file: %s", dbPath)
+
+		// Reconnect and migrate
+		_, err := database.Connect(cfg)
+		if err != nil {
+			return fmt.Errorf("failed to reconnect to database: %w", err)
+		}
+		defer func() { _ = database.Close() }()
+
+		if err := database.Migrate(ctx); err != nil {
+			return fmt.Errorf("failed to run migrations: %w", err)
+		}
+		printer.Success("Database recreated with fresh schema")
+	} else {
+		// PostgreSQL: Clean tables and run migrate
+		printer.Info("Connecting to database...")
+
+		db, err := database.Connect(cfg)
+		if err != nil {
+			return fmt.Errorf("failed to connect to database: %w", err)
+		}
+		defer func() { _ = database.Close() }()
+
+		printer.Info("Cleaning database...")
+		if err := database.CleanDatabase(ctx); err != nil {
+			return fmt.Errorf("failed to clean database: %w", err)
+		}
+
+		printer.Info("Running migrations...")
+		if err := database.Migrate(ctx); err != nil {
+			return fmt.Errorf("failed to run migrations: %w", err)
+		}
+
+		printer.Success("Database cleaned and schema updated")
+		printer.Info("Database: %s", getDatabaseInfo(cfg, db))
+	}
+
+	// Clean workspace data directory if --clean-ws is set
+	if dbCleanWS {
+		wsPath := cfg.GetWorkspacesDir()
+		if wsPath == "" {
+			printer.Warning("Workspaces path not configured, skipping workspace cleanup")
+		} else {
+			printer.Info("Removing workspace data: %s", wsPath)
+			if err := os.RemoveAll(wsPath); err != nil {
+				return fmt.Errorf("failed to remove workspaces directory: %w", err)
+			}
+			// Recreate the empty directory
+			if err := os.MkdirAll(wsPath, 0755); err != nil {
+				return fmt.Errorf("failed to recreate workspaces directory: %w", err)
+			}
+			printer.Success("Workspace data cleaned: %s", wsPath)
+		}
+	}
+
+	return nil
+}
+
+// runDBMigrate runs database migrations
+func runDBMigrate(cmd *cobra.Command, args []string) error {
+	if disableDB {
+		return fmt.Errorf("database commands unavailable: --disable-db flag is set")
+	}
+
+	printer := terminal.NewPrinter()
+	cfg := config.Get()
+
+	if cfg == nil {
+		return fmt.Errorf("configuration not loaded")
+	}
+
+	printer.Info("Connecting to database...")
+
+	// Connect to database
+	db, err := database.Connect(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	ctx := context.Background()
+
+	printer.Info("Running migrations...")
+
+	// Run migrations
+	if err := database.Migrate(ctx); err != nil {
+		return fmt.Errorf("failed to run migrations: %w", err)
+	}
+
+	printer.Success("Database migrations completed")
+	printer.Info("Database: %s", getDatabaseInfo(cfg, db))
+
+	return nil
+}
+
+// runDBList lists all database tables with row counts or records from a specific table
+func runDBList(cmd *cobra.Command, args []string) error {
+	if disableDB {
+		return fmt.Errorf("database commands unavailable: --disable-db flag is set")
+	}
+
+	printer := terminal.NewPrinter()
+	cfg := config.Get()
+
+	if cfg == nil {
+		return fmt.Errorf("configuration not loaded")
+	}
+
+	// Connect to database
+	_, err := database.Connect(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	ctx := context.Background()
+
+	// Ensure tables exist
+	if err := database.Migrate(ctx); err != nil {
+		return fmt.Errorf("failed to run migrations: %w", err)
+	}
+
+	// Handle --list flag (list table names only)
+	if dbListTables {
+		tables := database.ValidTableNames()
+		for _, t := range tables {
+			fmt.Println(t)
+		}
+		return nil
+	}
+
+	// Handle --clear flag
+	if dbClear {
+		if dbTable == "" {
+			return fmt.Errorf("--clear requires --table/-t flag")
+		}
+		if !globalForce {
+			printer.Warning("This will delete ALL records from table '%s'!", dbTable)
+			printer.Warning("Use --force to confirm")
+			return fmt.Errorf("operation aborted: use --force to confirm")
+		}
+		if err := database.ClearTable(ctx, dbTable); err != nil {
+			return fmt.Errorf("failed to clear table: %w", err)
+		}
+		printer.Success("Cleared all records from table '%s'", dbTable)
+		return nil
+	}
+
+	// Handle --list-columns flag
+	if dbListColumns {
+		if dbTable == "" {
+			return fmt.Errorf("--list-columns requires --table/-t flag")
+		}
+		columns := database.GetAllTableColumns(dbTable)
+		if len(columns) == 0 {
+			return fmt.Errorf("unknown table or no columns found: %s", dbTable)
+		}
+		printer.Info("Available columns for table '%s':", dbTable)
+		for _, col := range columns {
+			fmt.Printf("  %s\n", col)
+		}
+		return nil
+	}
+
+	// JSON mode bypasses TUI entirely
+	if globalJSON {
+		if dbTable != "" {
+			return listTableRecordsJSON(ctx)
+		}
+		return listAllTablesJSON(ctx)
+	}
+
+	// No-TUI mode or specific table with flags: use plain text output
+	if dbNoTUI || dbTable != "" {
+		if dbTable != "" {
+			return listTableRecords(ctx, cfg, printer)
+		}
+		return listAllTables(ctx, cfg, printer)
+	}
+
+	// Default: use interactive TUI
+	return runDBListTUI(ctx)
+}
+
+// runDBListTUI starts the interactive database TUI
+func runDBListTUI(ctx context.Context) error {
+	// Get all tables
+	tables, err := database.ListTables(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list tables: %w", err)
+	}
+
+	// Convert to terminal.TableInfo
+	tuiTables := make([]terminal.TableInfo, len(tables))
+	for i, t := range tables {
+		tuiTables[i] = terminal.TableInfo{
+			Name:     t.Name,
+			RowCount: t.RowCount,
+		}
+	}
+
+	// Record fetcher wraps database.GetTableRecords
+	recordFetcher := func(ctx context.Context, tableName string, offset, limit int, filters map[string]string, search string) (*terminal.TableRecords, error) {
+		excludeCols := getDefaultExcludeColumns(tableName)
+		result, err := database.GetTableRecords(ctx, tableName, offset, limit, filters, nil, search, excludeCols)
+		if err != nil {
+			return nil, err
+		}
+		return &terminal.TableRecords{
+			Table:      result.Table,
+			TotalCount: result.TotalCount,
+			Offset:     result.Offset,
+			Limit:      result.Limit,
+			Records:    result.Records,
+		}, nil
+	}
+
+	// Column fetcher wraps database.GetTableColumns (for display)
+	columnFetcher := func(tableName string) []string {
+		return database.GetTableColumns(tableName)
+	}
+
+	// All columns fetcher wraps database.GetAllTableColumns (for column selection)
+	allColumnsFetcher := func(tableName string) []string {
+		return database.GetAllTableColumns(tableName)
+	}
+
+	// Create and run TUI (pass dbLimit for page size)
+	tui := terminal.NewDBTUI(tuiTables, recordFetcher, columnFetcher, allColumnsFetcher, dbLimit)
+	return tui.Run()
+}
+
+// listAllTablesJSON outputs all tables as JSON
+func listAllTablesJSON(ctx context.Context) error {
+	tables, err := database.ListTables(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list tables: %w", err)
+	}
+	jsonBytes, err := json.Marshal(tables)
+	if err != nil {
+		return fmt.Errorf("failed to format tables: %w", err)
+	}
+	fmt.Println(string(jsonBytes))
+	return nil
+}
+
+// listTableRecordsJSON outputs table records as JSON only
+func listTableRecordsJSON(ctx context.Context) error {
+	// Validate limit
+	if dbLimit <= 0 {
+		dbLimit = 50
+	}
+	if dbLimit > 10000 {
+		dbLimit = 10000
+	}
+	if dbOffset < 0 {
+		dbOffset = 0
+	}
+
+	filters := parseWhereFilters(dbWhere)
+	excludeCols := getDefaultExcludeColumns(dbTable)
+	records, err := database.GetTableRecords(ctx, dbTable, dbOffset, dbLimit, filters, nil, dbSearch, excludeCols)
+	if err != nil {
+		return fmt.Errorf("failed to get records: %w", err)
+	}
+
+	jsonBytes, err := json.Marshal(records.Records)
+	if err != nil {
+		return fmt.Errorf("failed to format records: %w", err)
+	}
+	fmt.Println(string(jsonBytes))
+	return nil
+}
+
+// listAllTables lists all database tables with their row counts
+func listAllTables(ctx context.Context, cfg *config.Config, printer *terminal.Printer) error {
+	tables, err := database.ListTables(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list tables: %w", err)
+	}
+
+	printer.Info("Database: %s", getDatabaseInfo(cfg, nil))
+	fmt.Println()
+	fmt.Printf("%-20s %s\n", "Table", "Rows")
+	fmt.Println("─────────────────────────────")
+	for _, t := range tables {
+		fmt.Printf("%-20s %d\n", t.Name, t.RowCount)
+	}
+	fmt.Println()
+	printer.Info("Use --table <name> to list records from a specific table")
+
+	return nil
+}
+
+// runDBRefreshLoop continuously refreshes the table display at the specified interval
+func runDBRefreshLoop(ctx context.Context, cfg *config.Config, printer *terminal.Printer, interval time.Duration) error {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
+
+	for {
+		fmt.Print("\033[2J\033[H") // Clear screen
+		if err := listTableRecordsOnce(ctx, cfg, printer); err != nil {
+			printer.Error("Query failed: %s", err)
+		}
+		fmt.Printf("\n%s Refreshing every %s. Press Ctrl+C to stop.\n", terminal.Gray("⟳"), interval)
+
+		select {
+		case <-ticker.C:
+			continue
+		case <-sigChan:
+			fmt.Print("\033[2J\033[H")
+			printer.Info("Refresh stopped")
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// listTableRecords lists records from a specific table with pagination
+func listTableRecords(ctx context.Context, cfg *config.Config, printer *terminal.Printer) error {
+	// Check if refresh mode is enabled
+	if dbRefresh != "" {
+		interval, err := time.ParseDuration(dbRefresh)
+		if err != nil {
+			return fmt.Errorf("invalid refresh interval: %w", err)
+		}
+		if interval < time.Second {
+			return fmt.Errorf("refresh interval must be at least 1s")
+		}
+		return runDBRefreshLoop(ctx, cfg, printer, interval)
+	}
+	return listTableRecordsOnce(ctx, cfg, printer)
+}
+
+// listTableRecordsOnce performs a single query and displays the results
+func listTableRecordsOnce(ctx context.Context, cfg *config.Config, printer *terminal.Printer) error {
+	// Validate limit
+	if dbLimit <= 0 {
+		dbLimit = 50
+	}
+	if dbLimit > 10000 {
+		dbLimit = 10000
+	}
+
+	// Validate offset
+	if dbOffset < 0 {
+		dbOffset = 0
+	}
+
+	// Parse filters, columns, and exclude columns
+	filters := parseWhereFilters(dbWhere)
+	requestedColumns := parseColumns(dbColumns)
+	columns := getEffectiveColumns(dbTable, requestedColumns, dbAll)
+	excludeColumns := parseExcludeColumns(dbExcludeColumns)
+
+	// Determine if we should hide default columns (when no specific columns requested and not --all)
+	hideDefaultColumns := !dbAll && len(requestedColumns) == 0 && tableDefaultColumns[dbTable] == nil
+
+	sqlExcludeCols := getDefaultExcludeColumns(dbTable)
+	records, err := database.GetTableRecords(ctx, dbTable, dbOffset, dbLimit, filters, nil, dbSearch, sqlExcludeCols)
+	if err != nil {
+		return fmt.Errorf("failed to get records: %w", err)
+	}
+
+	// JSON-only output mode
+	if globalJSON {
+		jsonBytes, err := json.Marshal(records.Records)
+		if err != nil {
+			return fmt.Errorf("failed to format records: %w", err)
+		}
+		fmt.Println(string(jsonBytes))
+		return nil
+	}
+
+	// Calculate pagination info
+	startRecord := records.Offset + 1
+	endRecord := records.Offset + dbLimit
+	if endRecord > records.TotalCount {
+		endRecord = records.TotalCount
+	}
+	if records.TotalCount == 0 {
+		startRecord = 0
+	}
+
+	statsLine := fmt.Sprintf("%s Table: %s | Showing %s-%s of %s",
+		terminal.InfoSymbol(),
+		records.Table,
+		terminal.HiCyan(fmt.Sprintf("%d", startRecord)),
+		terminal.HiCyan(fmt.Sprintf("%d", endRecord)),
+		terminal.HiCyan(fmt.Sprintf("%d", records.TotalCount)),
+	)
+	if records.TotalCount > endRecord {
+		nextOffset := records.Offset + records.Limit
+		statsLine += fmt.Sprintf(" | Next: osmedeus db list -t %s --offset %s --limit %s",
+			dbTable,
+			terminal.HiCyan(fmt.Sprintf("%d", nextOffset)),
+			terminal.HiCyan(fmt.Sprintf("%d", dbLimit)),
+		)
+	}
+	fmt.Println(statsLine)
+	fmt.Println()
+
+	// Render table using tablewriter
+	renderTableWithTablewriter(dbTable, records.Records, columns, globalWidth, hideDefaultColumns, excludeColumns)
+
+	return nil
+}
+
+// parseWhereFilters parses --where flags into a map
+func parseWhereFilters(whereFlags []string) map[string]string {
+	filters := make(map[string]string)
+	for _, w := range whereFlags {
+		parts := strings.SplitN(w, "=", 2)
+		if len(parts) == 2 {
+			filters[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+		}
+	}
+	return filters
+}
+
+// parseColumns parses --columns flag into a slice
+func parseColumns(columnsFlag string) []string {
+	if columnsFlag == "" {
+		return nil
+	}
+	cols := strings.Split(columnsFlag, ",")
+	for i := range cols {
+		cols[i] = strings.TrimSpace(cols[i])
+	}
+	return cols
+}
+
+// parseExcludeColumns parses --exclude-columns flag into a map for O(1) lookup
+func parseExcludeColumns(excludeFlag string) map[string]bool {
+	excludeMap := make(map[string]bool)
+	if excludeFlag == "" {
+		return excludeMap
+	}
+	cols := strings.Split(excludeFlag, ",")
+	for _, col := range cols {
+		excludeMap[strings.TrimSpace(col)] = true
+	}
+	return excludeMap
+}
+
+// getDefaultExcludeColumns returns heavy columns to exclude for a given table.
+// Returns nil if --include-heavy is set or the table has no heavy columns.
+func getDefaultExcludeColumns(tableName string) []string {
+	if dbIncludeHeavy {
+		return nil
+	}
+	if tableName == "assets" {
+		return database.AssetHeavyColumns
+	}
+	return nil
+}
+
+// getEffectiveColumns determines which columns to display based on flags and table defaults
+func getEffectiveColumns(tableName string, requestedColumns []string, showAll bool) []string {
+	// If user specified columns, use them as-is
+	if len(requestedColumns) > 0 {
+		return requestedColumns
+	}
+
+	// If --all flag, return nil (show all columns)
+	if showAll {
+		return nil
+	}
+
+	// Check for table-specific defaults
+	if defaults, ok := tableDefaultColumns[tableName]; ok {
+		return defaults
+	}
+
+	// Return nil to indicate "all except hidden"
+	return nil
+}
+
+// isHiddenColumn checks if a column should be hidden by default
+func isHiddenColumn(col string) bool {
+	for _, hidden := range defaultHiddenColumns {
+		if col == hidden {
+			return true
+		}
+	}
+	return false
+}
+
+// renderTableWithTablewriter renders records directly to stdout using tablewriter
+func renderTableWithTablewriter(tableName string, records interface{}, columns []string, maxWidth int, hideDefaultColumns bool, excludeColumns map[string]bool) {
+	// Convert records to []map[string]interface{}
+	jsonBytes, _ := json.Marshal(records)
+	var data []map[string]interface{}
+	if err := json.Unmarshal(jsonBytes, &data); err != nil {
+		fmt.Println("No records found.")
+		return
+	}
+
+	if len(data) == 0 {
+		fmt.Println("No records found.")
+		return
+	}
+
+	// Get headers (all keys or selected columns)
+	var headers []string
+	if len(columns) > 0 {
+		for _, col := range columns {
+			if !excludeColumns[col] {
+				headers = append(headers, col)
+			}
+		}
+	} else {
+		for key := range data[0] {
+			if hideDefaultColumns && isHiddenColumn(key) {
+				continue
+			}
+			if excludeColumns[key] {
+				continue
+			}
+			headers = append(headers, key)
+		}
+		sort.Strings(headers)
+	}
+
+	// Build tablewriter options
+	opts := []tablewriter.Option{
+		tablewriter.WithRenderer(renderer.NewBlueprint(tw.Rendition{
+			Borders: tw.Border{
+				Left:   tw.Off,
+				Right:  tw.Off,
+				Top:    tw.Off,
+				Bottom: tw.Off,
+			},
+			Settings: tw.Settings{
+				Separators: tw.Separators{
+					BetweenColumns: tw.On,
+					BetweenRows:    tw.Off,
+				},
+				Lines: tw.Lines{
+					ShowHeaderLine: tw.On,
+					ShowTop:        tw.Off,
+					ShowBottom:     tw.Off,
+					ShowFooterLine: tw.Off,
+				},
+			},
+			Symbols: tw.NewSymbols(tw.StyleLight),
+		})),
+		tablewriter.WithHeaderAlignment(tw.AlignLeft),
+		tablewriter.WithRowAlignment(tw.AlignLeft),
+		tablewriter.WithHeaderAutoFormat(tw.Off),
+		tablewriter.WithHeaderAutoWrap(tw.WrapNone),
+		tablewriter.WithTrimSpace(tw.On),
+	}
+	// Auto-detect terminal width if maxWidth is 0
+	effectiveWidth := maxWidth
+	if effectiveWidth == 0 {
+		if w, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && w > 0 {
+			effectiveWidth = w
+		}
+	}
+	if effectiveWidth > 0 && len(headers) > 0 {
+		// Compute per-column widths that fill the terminal width.
+		// WithMaxWidth only caps columns — short-content columns don't expand to fill space.
+		// Using WithColumnWidths forces each column to the allocated width.
+		numCols := len(headers)
+		// Overhead: " │ " (3 chars) between columns, plus leading/trailing space
+		overhead := (numCols-1)*3 + 2
+		available := effectiveWidth - overhead
+
+		widths := tw.NewMapper[int, int]()
+		displayNames := tableColumnDisplayNames[tableName]
+		if available >= numCols*4 {
+			// Base width per column = display header length + 2 (padding), minimum 8
+			mins := make([]int, numCols)
+			totalMin := 0
+			for i, h := range headers {
+				hLen := len(h)
+				if displayNames != nil {
+					if alias, ok := displayNames[h]; ok {
+						hLen = len(alias)
+					}
+				}
+				mins[i] = hLen + 2
+				if mins[i] < 8 {
+					mins[i] = 8
+				}
+				totalMin += mins[i]
+			}
+			if totalMin >= available {
+				// Terminal too narrow for headers — equal distribution
+				perCol := available / numCols
+				for i := range headers {
+					widths[i] = max(perCol, 4)
+				}
+			} else {
+				// Distribute surplus using per-column weights (default weight = 1)
+				surplus := available - totalMin
+				colWeights := tableColumnWeights[tableName]
+				totalWeight := 0
+				weights := make([]int, numCols)
+				for i, h := range headers {
+					w := 1
+					if colWeights != nil {
+						if cw, ok := colWeights[h]; ok {
+							w = cw
+						}
+					}
+					weights[i] = w
+					totalWeight += w
+				}
+				for i := range headers {
+					widths[i] = mins[i] + surplus*weights[i]/totalWeight
+				}
+			}
+			opts = append(opts, tablewriter.WithColumnWidths(widths))
+		} else {
+			opts = append(opts, tablewriter.WithMaxWidth(effectiveWidth))
+		}
+		opts = append(opts, tablewriter.WithRowAutoWrap(tw.WrapBreak))
+	} else if effectiveWidth == 0 {
+		// No width constraint (piped output) — apply per-column minimums if defined
+		if colWidths, ok := tableColumnMinWidths[tableName]; ok {
+			widths := tw.NewMapper[int, int]()
+			for i, h := range headers {
+				if minW, exists := colWidths[h]; exists {
+					widths[i] = minW
+				}
+			}
+			if len(widths) > 0 {
+				opts = append(opts, tablewriter.WithColumnWidths(widths))
+			}
+		}
+	}
+
+	table := tablewriter.NewTable(os.Stdout, opts...)
+
+	// Convert headers to []any for variadic call, applying display name aliases
+	displayNames := tableColumnDisplayNames[tableName]
+	headerArgs := make([]any, len(headers))
+	for i, h := range headers {
+		if displayNames != nil {
+			if alias, ok := displayNames[h]; ok {
+				headerArgs[i] = alias
+				continue
+			}
+		}
+		headerArgs[i] = h
+	}
+	table.Header(headerArgs...)
+
+	// Add data rows
+	for _, row := range data {
+		rowArgs := make([]any, len(headers))
+		for i, h := range headers {
+			rowArgs[i] = formatTableValue(row[h], h)
+		}
+		_ = table.Append(rowArgs...)
+	}
+
+	_ = table.Render()
+}
+
+// formatTableValue converts a value to string for table display and applies column-specific coloring
+func formatTableValue(v interface{}, columnName string) string {
+	if v == nil {
+		return ""
+	}
+
+	var s string
+	switch val := v.(type) {
+	case string:
+		s = strings.ReplaceAll(val, "\n", " ")
+	case []interface{}:
+		// Format arrays as comma-separated values without brackets/quotes
+		parts := make([]string, 0, len(val))
+		for _, item := range val {
+			parts = append(parts, fmt.Sprintf("%v", item))
+		}
+		s = strings.Join(parts, ", ")
+	case map[string]interface{}:
+		b, _ := json.Marshal(val)
+		s = string(b)
+	default:
+		s = fmt.Sprintf("%v", val)
+	}
+
+	// Apply column-specific coloring
+	switch columnName {
+	case "status":
+		s = terminal.ColorizeStatus(s)
+	case "trigger_type":
+		s = terminal.ColorizeTriggerType(s)
+	case "is_enabled":
+		s = terminal.ColorizeEnabled(s)
+	case "workflow_kind":
+		s = terminal.ColorizeWorkflowKind(s)
+	case "schedule":
+		s = terminal.ColorizeSchedule(s)
+	case "status_code":
+		s = terminal.ColorizeStatusCode(s)
+	case "source":
+		s = terminal.ColorizeSource(s)
+	case "asset_type":
+		s = terminal.ColorizeAssetType(s)
+	case "tech":
+		s = terminal.Gray(s)
+	}
+
+	return s
+}
+
+// getDatabaseInfo returns a human-readable database info string
+func getDatabaseInfo(cfg *config.Config, db interface{}) string {
+	if cfg.IsPostgres() {
+		return fmt.Sprintf("PostgreSQL @ %s:%d/%s", cfg.Database.Host, cfg.Database.Port, cfg.Database.DBName)
+	}
+	return fmt.Sprintf("SQLite @ %s", cfg.GetDBPath())
+}
+
+// runIndexWorkflows indexes workflows from filesystem to database
+func runIndexWorkflows(cmd *cobra.Command, args []string) error {
+	if disableDB {
+		return fmt.Errorf("database commands unavailable: --disable-db flag is set")
+	}
+
+	printer := terminal.NewPrinter()
+	cfg := config.Get()
+
+	if cfg == nil {
+		return fmt.Errorf("configuration not loaded")
+	}
+
+	printer.Info("Connecting to database...")
+
+	// Connect to database
+	_, err := database.Connect(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	ctx := context.Background()
+
+	// Ensure tables exist
+	if err := database.Migrate(ctx); err != nil {
+		return fmt.Errorf("failed to run migrations: %w", err)
+	}
+
+	printer.Info("Indexing workflows from: %s", cfg.WorkflowsPath)
+	if dbIndexForce {
+		printer.Info("Force mode: re-indexing all workflows")
+	}
+
+	// Index workflows
+	result, err := database.IndexWorkflowsFromFilesystem(ctx, cfg.WorkflowsPath, dbIndexForce)
+	if err != nil {
+		return fmt.Errorf("failed to index workflows: %w", err)
+	}
+
+	// Print results
+	printer.Success("Workflow indexing completed")
+	fmt.Println()
+	fmt.Printf("  Added:   %d\n", result.Added)
+	fmt.Printf("  Updated: %d\n", result.Updated)
+	fmt.Printf("  Removed: %d\n", result.Removed)
+
+	if len(result.Errors) > 0 {
+		fmt.Println()
+		printer.Warning("Errors encountered:")
+		for _, e := range result.Errors {
+			printer.Bullet(e)
+		}
+	}
+
+	// Show total count
+	count, err := database.GetWorkflowCount(ctx)
+	if err == nil {
+		fmt.Println()
+		printer.Info("Total workflows indexed: %d", count)
+	}
+
+	return nil
+}

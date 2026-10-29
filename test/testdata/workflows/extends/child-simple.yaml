@@ -1,0 +1,9 @@
+kind: module
+name: child-simple
+description: Simple child that only overrides params
+extends: base-module
+
+override:
+  params:
+    threads: "5"
+    timeout: "1800"

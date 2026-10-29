@@ -1,0 +1,24 @@
+services:
+  osm-canary:
+    build:
+      context: ../..
+      dockerfile: build/docker/Dockerfile.canary
+    container_name: osm-canary
+    hostname: osm-canary
+    volumes:
+      - canary-workspaces:/root/workspaces-osmedeus
+      - canary-data:/root/osmedeus-base
+      - ../../platform/osmedeus-workflow:/root/osmedeus-base/workflows
+    ports:
+      - "8002:8002"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8002/health"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+    restart: "no"
+
+volumes:
+  canary-workspaces:
+  canary-data:

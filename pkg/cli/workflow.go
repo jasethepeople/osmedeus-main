@@ -1,0 +1,1785 @@
+package cli
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+
+	"github.com/charmbracelet/glamour"
+	"github.com/j3ssie/osmedeus/v5/internal/config"
+	"github.com/j3ssie/osmedeus/v5/internal/core"
+	"github.com/j3ssie/osmedeus/v5/internal/linter"
+	"github.com/j3ssie/osmedeus/v5/internal/parser"
+	"github.com/j3ssie/osmedeus/v5/internal/terminal"
+	"github.com/mattn/go-runewidth"
+	"github.com/spf13/cobra"
+	"golang.org/x/term"
+)
+
+// workflowCmd represents the workflow command
+var workflowCmd = &cobra.Command{
+	Use:   "workflow [search]",
+	Short: "Manage workflows",
+	Long:  UsageWorkflow(),
+	Args:  cobra.MaximumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		// Default to 'list' when no subcommand is specified
+		return workflowListCmd.RunE(cmd, args)
+	},
+}
+
+// workflowListCmd lists available workflows
+var workflowListCmd = &cobra.Command{
+	Use:     "list [search]",
+	Aliases: []string{"ls"},
+	Short:   "List available workflows",
+	Args:    cobra.MaximumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cfg := config.Get()
+		if cfg == nil {
+			return fmt.Errorf("configuration not loaded")
+		}
+
+		// Resolve search term from positional arg or --search flag
+		searchTerm := searchQuery
+		if len(args) > 0 && args[0] != "" {
+			searchTerm = args[0]
+		}
+
+		loader := parser.NewLoader(cfg.WorkflowsPath)
+
+		// List flows
+		flows, err := loader.ListFlows()
+		if err != nil {
+			return fmt.Errorf("failed to list flows: %w", err)
+		}
+
+		// List modules
+		modules, err := loader.ListModules()
+		if err != nil {
+			return fmt.Errorf("failed to list modules: %w", err)
+		}
+
+		// Table format output
+		printer := terminal.NewPrinter()
+		fmt.Println()
+		title := fmt.Sprintf("Available Workflows (%s)", terminal.Gray(cfg.WorkflowsPath))
+		if searchTerm != "" {
+			title = fmt.Sprintf("Available Workflows - Search: %s", terminal.Cyan(searchTerm))
+		} else if len(filterTags) > 0 {
+			title = fmt.Sprintf("Available Workflows - Filtered by tags: %s", terminal.Cyan(strings.Join(filterTags, ", ")))
+		}
+		fmt.Printf("%s %s\n", terminal.InfoSymbol(), terminal.Bold(title))
+
+		// Combined table for all workflows
+		if len(flows) > 0 || len(modules) > 0 {
+			// Collect all workflow data first to calculate column widths
+			type workflowRow struct {
+				name        string
+				colorName   string // name with color codes
+				wfType      string
+				desc        string
+				reqParams   string
+				steps       string // step/module count
+				tags        string
+				targetTypes string
+				usage       string // from Help.Usage
+			}
+			var rows []workflowRow
+			uniqueTags := make(map[string]bool) // Collect unique tags across all workflows
+
+			// Track workflows with errors for verbose mode
+			type workflowError struct {
+				name string
+				err  error
+			}
+			var workflowErrors []workflowError
+			hasTargetRequired := false // Track if any workflow has required Target
+
+			// Load flows
+			for _, f := range flows {
+				wf, err := loader.LoadWorkflow(f)
+				if err != nil {
+					workflowErrors = append(workflowErrors, workflowError{name: f, err: err})
+					continue
+				}
+				// Skip hidden workflows
+				if wf.Hidden {
+					continue
+				}
+				// Skip if tags filter is specified and workflow doesn't match
+				if len(filterTags) > 0 && !hasMatchingTags(wf, filterTags) {
+					continue
+				}
+				// Skip if search term doesn't match
+				if searchTerm != "" && !matchesSearch(wf, f, searchTerm) {
+					continue
+				}
+				desc := "-"
+				if wf.Description != "" {
+					desc = truncateString(wf.Description, 60)
+				}
+				reqParams := getRequiredParams(wf)
+				// Track if any workflow has required Target
+				if workflowHasRequiredTarget(wf) {
+					hasTargetRequired = true
+				}
+				steps := "-"
+				// Count modules for flows
+				if len(wf.Modules) > 0 {
+					steps = fmt.Sprintf("%d modules", len(wf.Modules))
+				}
+				tags := "-"
+				if len(wf.Tags) > 0 {
+					tags = truncateString(strings.Join(wf.Tags, ", "), 25)
+					// Collect unique tags (from raw tags, not truncated)
+					for _, tag := range wf.Tags {
+						uniqueTags[tag] = true
+					}
+				}
+				targetTypes := getTargetTypes(wf)
+				usage := wf.GetUsage()
+				name := f
+				colorName := f
+				if f == "general" {
+					name = f + " (default)"
+					colorName = terminal.Green(name)
+				}
+				rows = append(rows, workflowRow{name, colorName, "flow", desc, reqParams, steps, tags, targetTypes, usage})
+			}
+
+			// Load modules
+			for _, m := range modules {
+				wf, err := loader.LoadWorkflow(m)
+				if err != nil {
+					workflowErrors = append(workflowErrors, workflowError{name: m, err: err})
+					continue
+				}
+				// Skip hidden workflows
+				if wf.Hidden {
+					continue
+				}
+				// Skip if tags filter is specified and workflow doesn't match
+				if len(filterTags) > 0 && !hasMatchingTags(wf, filterTags) {
+					continue
+				}
+				// Skip if search term doesn't match
+				if searchTerm != "" && !matchesSearch(wf, m, searchTerm) {
+					continue
+				}
+				desc := "-"
+				if wf.Description != "" {
+					desc = truncateString(wf.Description, 60)
+				}
+				reqParams := getRequiredParams(wf)
+				// Track if any workflow has required Target
+				if workflowHasRequiredTarget(wf) {
+					hasTargetRequired = true
+				}
+				steps := "-"
+				// Count steps for modules
+				if len(wf.Steps) > 0 {
+					steps = fmt.Sprintf("%d steps", len(wf.Steps))
+				}
+				tags := "-"
+				if len(wf.Tags) > 0 {
+					tags = truncateString(strings.Join(wf.Tags, ", "), 25)
+					// Collect unique tags (from raw tags, not truncated)
+					for _, tag := range wf.Tags {
+						uniqueTags[tag] = true
+					}
+				}
+				targetTypes := getTargetTypes(wf)
+				usage := wf.GetUsage()
+				rows = append(rows, workflowRow{m, m, "module", desc, reqParams, steps, tags, targetTypes, usage})
+			}
+
+			// Check if any workflows matched the filter
+			if len(rows) == 0 && (len(filterTags) > 0 || searchTerm != "") {
+				fmt.Println()
+				if searchTerm != "" {
+					printer.Warning("No workflows found matching: %s", searchTerm)
+				} else {
+					printer.Warning("No workflows found with tags: %s", strings.Join(filterTags, ", "))
+				}
+				fmt.Println()
+				return nil
+			}
+
+			if globalJSON {
+				var jsonRows []map[string]interface{}
+				for _, r := range rows {
+					jsonRows = append(jsonRows, map[string]interface{}{
+						"name":            r.name,
+						"type":            r.wfType,
+						"description":     r.desc,
+						"required_params": r.reqParams,
+						"steps":           r.steps,
+						"tags":            r.tags,
+						"target_types":    r.targetTypes,
+						"usage":           r.usage,
+					})
+				}
+				jsonBytes, err := json.MarshalIndent(jsonRows, "", "  ")
+				if err != nil {
+					return fmt.Errorf("failed to marshal workflows: %w", err)
+				}
+				fmt.Println(string(jsonBytes))
+				return nil
+			}
+
+			// Calculate max widths
+			nameWidth := len("Name")
+			typeWidth := len("Type")
+			descWidth := len("Description")
+			paramsWidth := len("Required Params")
+			stepsWidth := len("Steps")
+			tagsWidth := len("Tags")
+			targetTypesWidth := len("Target Types")
+
+			for _, r := range rows {
+				if len(r.name) > nameWidth {
+					nameWidth = len(r.name)
+				}
+				if len(r.wfType) > typeWidth {
+					typeWidth = len(r.wfType)
+				}
+				if len(r.desc) > descWidth {
+					descWidth = len(r.desc)
+				}
+				if len(r.reqParams) > paramsWidth {
+					paramsWidth = len(r.reqParams)
+				}
+				if len(r.steps) > stepsWidth {
+					stepsWidth = len(r.steps)
+				}
+				if showTags && len(r.tags) > tagsWidth {
+					tagsWidth = len(r.tags)
+				}
+				if len(r.targetTypes) > targetTypesWidth {
+					targetTypesWidth = len(r.targetTypes)
+				}
+			}
+
+			// Print markdown table with styled headers
+			fmt.Println()
+			if showTags {
+				// With Tags column
+				fmt.Printf("| %s%s | %s%s | %s%s | %s%s | %s%s | %s%s | %s%s |\n",
+					terminal.Bold("Name"), strings.Repeat(" ", nameWidth-4),
+					terminal.Bold("Type"), strings.Repeat(" ", typeWidth-4),
+					terminal.Bold("Description"), strings.Repeat(" ", descWidth-11),
+					terminal.Bold("Required Params"), strings.Repeat(" ", paramsWidth-15),
+					terminal.Bold("Steps"), strings.Repeat(" ", stepsWidth-5),
+					terminal.Bold("Target Types"), strings.Repeat(" ", targetTypesWidth-12),
+					terminal.Bold("Tags"), strings.Repeat(" ", tagsWidth-4))
+				fmt.Printf("|-%s-|-%s-|-%s-|-%s-|-%s-|-%s-|-%s-|\n",
+					strings.Repeat("-", nameWidth), strings.Repeat("-", typeWidth),
+					strings.Repeat("-", descWidth), strings.Repeat("-", paramsWidth),
+					strings.Repeat("-", stepsWidth), strings.Repeat("-", targetTypesWidth),
+					strings.Repeat("-", tagsWidth))
+			} else {
+				// Without Tags column (default)
+				fmt.Printf("| %s%s | %s%s | %s%s | %s%s | %s%s | %s%s |\n",
+					terminal.Bold("Name"), strings.Repeat(" ", nameWidth-4),
+					terminal.Bold("Type"), strings.Repeat(" ", typeWidth-4),
+					terminal.Bold("Description"), strings.Repeat(" ", descWidth-11),
+					terminal.Bold("Required Params"), strings.Repeat(" ", paramsWidth-15),
+					terminal.Bold("Steps"), strings.Repeat(" ", stepsWidth-5),
+					terminal.Bold("Target Types"), strings.Repeat(" ", targetTypesWidth-12))
+				fmt.Printf("|-%s-|-%s-|-%s-|-%s-|-%s-|-%s-|\n",
+					strings.Repeat("-", nameWidth), strings.Repeat("-", typeWidth),
+					strings.Repeat("-", descWidth), strings.Repeat("-", paramsWidth),
+					strings.Repeat("-", stepsWidth), strings.Repeat("-", targetTypesWidth))
+			}
+
+			for _, r := range rows {
+				// Calculate padding needed (color codes don't take visual space)
+				namePad := nameWidth - len(r.name)
+				var colorType string
+				switch r.wfType {
+				case "flow":
+					colorType = terminal.Cyan(r.wfType)
+				default:
+					colorType = terminal.Yellow(r.wfType)
+				}
+				typePad := typeWidth - len(r.wfType)
+				colorSteps := terminal.Gray(r.steps)
+				stepsPad := stepsWidth - len(r.steps)
+				colorTargetTypes := terminal.Magenta(r.targetTypes)
+				targetTypesPad := targetTypesWidth - len(r.targetTypes)
+				// Highlight "Target" in blue within reqParams
+				colorReqParams := strings.ReplaceAll(r.reqParams, "Target", terminal.HiBlue("Target"))
+				paramsPad := paramsWidth - len(r.reqParams)
+
+				if showTags {
+					colorTags := terminal.Gray(r.tags)
+					tagsPad := tagsWidth - len(r.tags)
+					fmt.Printf("| %s%s | %s%s | %-*s | %s%s | %s%s | %s%s | %s%s |\n",
+						r.colorName, strings.Repeat(" ", namePad),
+						colorType, strings.Repeat(" ", typePad),
+						descWidth, r.desc,
+						colorReqParams, strings.Repeat(" ", paramsPad),
+						colorSteps, strings.Repeat(" ", stepsPad),
+						colorTargetTypes, strings.Repeat(" ", targetTypesPad),
+						colorTags, strings.Repeat(" ", tagsPad))
+				} else {
+					fmt.Printf("| %s%s | %s%s | %-*s | %s%s | %s%s | %s%s |\n",
+						r.colorName, strings.Repeat(" ", namePad),
+						colorType, strings.Repeat(" ", typePad),
+						descWidth, r.desc,
+						colorReqParams, strings.Repeat(" ", paramsPad),
+						colorSteps, strings.Repeat(" ", stepsPad),
+						colorTargetTypes, strings.Repeat(" ", targetTypesPad))
+				}
+
+				// Print usage sub-row if --usage flag is set and workflow has usage info
+				if showUsage && r.usage != "" {
+					usageText := terminal.Gray(" Usage: " + r.usage)
+					usageDisplayLen := len(stripAnsi(usageText))
+					usagePad := descWidth - usageDisplayLen
+					if usagePad < 0 {
+						usagePad = 0
+					}
+					if showTags {
+						fmt.Printf("| %s | %s | %s%s | %s | %s | %s | %s |\n",
+							strings.Repeat(" ", nameWidth),
+							strings.Repeat(" ", typeWidth),
+							usageText, strings.Repeat(" ", usagePad),
+							strings.Repeat(" ", paramsWidth),
+							strings.Repeat(" ", stepsWidth),
+							strings.Repeat(" ", targetTypesWidth),
+							strings.Repeat(" ", tagsWidth))
+					} else {
+						fmt.Printf("| %s | %s | %s%s | %s | %s | %s |\n",
+							strings.Repeat(" ", nameWidth),
+							strings.Repeat(" ", typeWidth),
+							usageText, strings.Repeat(" ", usagePad),
+							strings.Repeat(" ", paramsWidth),
+							strings.Repeat(" ", stepsWidth),
+							strings.Repeat(" ", targetTypesWidth))
+					}
+				}
+			}
+
+			fmt.Println()
+
+			// Show tip about Target parameter if any workflow requires it
+			if hasTargetRequired {
+				fmt.Printf("%s %s\n\n", terminal.HiBlue("ℹ"), terminal.HiBlue("\"Target\" in Required Params is supplied via -t flag (e.g., -t example.com) or each line from -T list-of-targets.txt"))
+			}
+
+			// Count flows and modules in filtered results
+			flowCount := 0
+			moduleCount := 0
+			for _, r := range rows {
+				switch r.wfType {
+				case "flow":
+					flowCount++
+				default:
+					moduleCount++
+				}
+			}
+
+			// Convert unique tags map to sorted slice
+			var tagList []string
+			for tag := range uniqueTags {
+				tagList = append(tagList, tag)
+			}
+			// Sort tags alphabetically for consistent display
+			if len(tagList) > 1 {
+				for i := 0; i < len(tagList)-1; i++ {
+					for j := i + 1; j < len(tagList); j++ {
+						if tagList[i] > tagList[j] {
+							tagList[i], tagList[j] = tagList[j], tagList[i]
+						}
+					}
+				}
+			}
+
+			// Summary with colors
+			if len(filterTags) > 0 {
+				summaryParts := []string{
+					terminal.Green(fmt.Sprintf("%d", flowCount)) + " flows",
+					terminal.Yellow(fmt.Sprintf("%d", moduleCount)) + " modules",
+				}
+				fmt.Printf("◆ Matching: %s (filtered by tags: %s)\n",
+					strings.Join(summaryParts, ", "),
+					terminal.Cyan(strings.Join(filterTags, ", ")))
+			} else {
+				summaryParts := []string{
+					terminal.Green(fmt.Sprintf("%d", flowCount)) + " flows",
+					terminal.Yellow(fmt.Sprintf("%d", moduleCount)) + " modules",
+				}
+				summaryParts = append(summaryParts, terminal.Cyan(fmt.Sprintf("%d", len(tagList)))+" unique tags")
+				fmt.Printf("◆ Total: %s\n", strings.Join(summaryParts, ", "))
+			}
+
+			// Show available tags
+			if len(tagList) > 0 {
+				tagsDisplay := strings.Join(tagList, ", ")
+				if len(tagsDisplay) > 80 {
+					tagsDisplay = tagsDisplay[:77] + "..."
+				}
+				fmt.Printf("◇ Available tags: %s\n", terminal.Gray(tagsDisplay))
+			}
+
+			// Search & filter workflows hint
+			binaryPath := os.Args[0]
+			fmt.Println()
+			fmt.Println("◌ " + terminal.Bold("Search workflows:"))
+			fmt.Printf("  %s workflow ls %s\n", terminal.Cyan(binaryPath), terminal.Yellow("<search_term>"))
+			fmt.Printf("  %s workflow ls --search %s\n", terminal.Cyan(binaryPath), terminal.Yellow("<search_term>"))
+			fmt.Printf("  %s workflow ls --tags %s\n", terminal.Cyan(binaryPath), terminal.Yellow("recon,fast"))
+			fmt.Printf("  %s workflow ls --show-tags\n", terminal.Cyan(binaryPath))
+
+			// View workflow details hint
+			fmt.Println()
+			fmt.Println("◌ " + terminal.Bold("View workflow details:"))
+			fmt.Printf("  %s workflow show %s\n", terminal.Cyan(binaryPath), terminal.Yellow("<workflow_name>"))
+
+			// Validate workflow hint
+			fmt.Println()
+			fmt.Println("◌ " + terminal.Bold("Validate workflow:"))
+			fmt.Printf("  %s workflow validate %s\n", terminal.Cyan(binaryPath), terminal.Yellow("<workflow_name>"))
+
+			// Example run usage
+			fmt.Println()
+			fmt.Println("◌ " + terminal.Bold("Example Run Usage:"))
+			fmt.Printf("  %s run -f %s -t <target>\n", terminal.Cyan(binaryPath), terminal.Yellow("<flow_name>"))
+			fmt.Printf("  %s run -f general -T list_of_targets.txt\n", terminal.Cyan(binaryPath))
+			fmt.Printf("  %s run --threads-hold 10 -t sample.com\n", terminal.Cyan(binaryPath))
+			fmt.Printf("  %s run -t sample.com -x %s\n", terminal.Cyan(binaryPath), terminal.Yellow("<exclude_module>"))
+			fmt.Printf("  %s run -m %s -t <target> --params %s\n",
+				terminal.Cyan(binaryPath),
+				terminal.Yellow("<module_name>"),
+				terminal.Gray("<key=value>"))
+
+			fmt.Println()
+			fmt.Printf("%s Tip: %s %s\n", terminal.Gray(terminal.SymbolLightning), terminal.Cyan("osmedeus run --help"), terminal.Gray("for more usage and options"))
+			fmt.Println()
+
+			// Show workflow errors if verbose mode
+			if showVerbose && len(workflowErrors) > 0 {
+				fmt.Printf("%s Workflows with Errors (%d):\n", terminal.WarningSymbol(), len(workflowErrors))
+				for _, we := range workflowErrors {
+					fmt.Printf("  %s\n", terminal.Yellow(we.name))
+					fmt.Printf("    └─ %s\n", terminal.Gray(we.err.Error()))
+				}
+				fmt.Println()
+			}
+		} else {
+			printer.Warning("No workflows found in %s", cfg.WorkflowsPath)
+		}
+
+		return nil
+	},
+}
+
+// truncateString truncates a string to maxLen and adds "..." if needed
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
+}
+
+// getRequiredParams returns a comma-separated list of required parameter names
+func getRequiredParams(wf *core.Workflow) string {
+	var required []string
+
+	// Check dependencies.variables for required Target
+	if wf.Dependencies != nil {
+		for _, v := range wf.Dependencies.Variables {
+			if v.Required && strings.EqualFold(v.Name, "Target") {
+				required = append(required, "Target")
+				break
+			}
+		}
+	}
+
+	// Check params (existing logic, but skip if already added Target)
+	for _, p := range wf.Params {
+		if p.Required {
+			// Skip if it's a target param and we already added from dependencies
+			if strings.EqualFold(p.Name, "Target") && containsTargetParam(required) {
+				continue
+			}
+			required = append(required, p.Name)
+		}
+	}
+
+	if len(required) == 0 {
+		return "-"
+	}
+	return strings.Join(required, ", ")
+}
+
+// containsTargetParam checks if required list already has Target entry
+func containsTargetParam(required []string) bool {
+	for _, r := range required {
+		if strings.EqualFold(r, "Target") {
+			return true
+		}
+	}
+	return false
+}
+
+// workflowHasRequiredTarget checks if a workflow has a required Target in dependencies.variables
+func workflowHasRequiredTarget(wf *core.Workflow) bool {
+	if wf.Dependencies == nil {
+		return false
+	}
+	for _, v := range wf.Dependencies.Variables {
+		if v.Required && strings.EqualFold(v.Name, "Target") {
+			return true
+		}
+	}
+	return false
+}
+
+// getTargetTypes returns a comma-separated list of target types from dependencies
+func getTargetTypes(wf *core.Workflow) string {
+	if wf.Dependencies == nil {
+		return "-"
+	}
+
+	var types []string
+	seen := make(map[string]bool)
+
+	// First check dependencies.target_types if available
+	for _, t := range wf.Dependencies.TargetTypes {
+		typeStr := string(t)
+		if typeStr != "" && !seen[typeStr] {
+			types = append(types, typeStr)
+			seen[typeStr] = true
+		}
+	}
+
+	// Then check dependencies.variables[].type
+	for _, v := range wf.Dependencies.Variables {
+		typeStr := string(v.Type)
+		if typeStr != "" && !seen[typeStr] {
+			types = append(types, typeStr)
+			seen[typeStr] = true
+		}
+	}
+
+	if len(types) == 0 {
+		return "-"
+	}
+	return strings.Join(types, ", ")
+}
+
+// stripAnsi removes ANSI escape codes for length calculation
+func stripAnsi(s string) string {
+	re := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	return re.ReplaceAllString(s, "")
+}
+
+// displayWidth returns the visual display width of a string, ignoring ANSI codes.
+// Unlike len(), this correctly handles multi-byte Unicode characters like ✔ (3 bytes, 1 display char).
+func displayWidth(s string) int {
+	return runewidth.StringWidth(stripAnsi(s))
+}
+
+// categorizeParams is a convenience wrapper around core.CategorizeParams
+func categorizeParams(params []core.Param) (toggle, speed, config, general []core.Param) {
+	return core.CategorizeParams(params)
+}
+
+// printToggleParams prints toggle parameters with green highlighting
+func printToggleParams(params []core.Param) {
+	if len(params) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Println("◐ " + terminal.Bold("Toggle Parameters:"))
+	var rows [][]string
+	for _, p := range params {
+		required := terminal.Gray("no")
+		if p.Required {
+			required = terminal.Green("yes")
+		}
+		defaultVal := p.DefaultString()
+		if defaultVal == "" {
+			defaultVal = "-"
+		}
+		// Color the default value based on true/false
+		coloredDefault := defaultVal
+		if strings.ToLower(defaultVal) == "true" {
+			coloredDefault = terminal.Green(defaultVal)
+		} else if strings.ToLower(defaultVal) == "false" {
+			coloredDefault = terminal.Gray(defaultVal)
+		}
+		rows = append(rows, []string{terminal.Green(p.Name), coloredDefault, required})
+	}
+	printMarkdownTable([]string{"Name", "Default", "Required"}, rows)
+}
+
+// printSpeedControlParams prints speed/performance parameters with yellow highlighting
+func printSpeedControlParams(params []core.Param) {
+	if len(params) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Println("◎ " + terminal.Bold("Speed Control Parameters:"))
+	var rows [][]string
+	for _, p := range params {
+		required := terminal.Gray("no")
+		if p.Required {
+			required = terminal.Green("yes")
+		}
+		defaultVal := p.DefaultString()
+		if defaultVal == "" {
+			defaultVal = "-"
+		}
+		// Color numeric values in yellow
+		coloredDefault := terminal.Yellow(defaultVal)
+		rows = append(rows, []string{terminal.Yellow(p.Name), coloredDefault, required})
+	}
+	printMarkdownTable([]string{"Name", "Default", "Required"}, rows)
+}
+
+// printToggleParamsGrouped prints all toggle parameters across modules in a single table
+func printToggleParamsGrouped(rows [][]string) {
+	if len(rows) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Println("◐ " + terminal.Bold("Toggle Parameters:"))
+	printMarkdownTable([]string{"Module", "Name", "Default", "Required"}, rows)
+}
+
+// printSpeedControlParamsGrouped prints all speed control parameters across modules in a single table
+func printSpeedControlParamsGrouped(rows [][]string) {
+	if len(rows) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Println("◎ " + terminal.Bold("Speed Control Parameters:"))
+	printMarkdownTable([]string{"Module", "Name", "Default", "Required"}, rows)
+}
+
+// printConfigParams prints config parameters with magenta highlighting
+func printConfigParams(params []core.Param) {
+	if len(params) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Println("⚙ " + terminal.Bold("Config Parameters:"))
+	var rows [][]string
+	for _, p := range params {
+		required := terminal.Gray("no")
+		if p.Required {
+			required = terminal.Green("yes")
+		}
+		defaultVal := p.DefaultString()
+		if defaultVal == "" {
+			defaultVal = "-"
+		}
+		coloredDefault := terminal.Magenta(defaultVal)
+		if defaultVal == "-" {
+			coloredDefault = defaultVal
+		}
+		rows = append(rows, []string{terminal.Magenta(p.Name), coloredDefault, required})
+	}
+	printMarkdownTable([]string{"Name", "Default", "Required"}, rows)
+}
+
+// printGeneralParams prints general parameters with cyan highlighting
+func printGeneralParams(params []core.Param) {
+	if len(params) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Println("● " + terminal.Bold("General Parameters:"))
+	var rows [][]string
+	for _, p := range params {
+		required := terminal.Gray("no")
+		if p.Required {
+			required = terminal.Green("yes")
+		}
+		defaultVal := p.DefaultString()
+		if defaultVal == "" {
+			defaultVal = "-"
+		}
+		coloredDefault := terminal.Cyan(defaultVal)
+		if defaultVal == "-" {
+			coloredDefault = defaultVal
+		}
+		rows = append(rows, []string{terminal.Cyan(p.Name), coloredDefault, required})
+	}
+	// Use width-aware table to wrap long default values
+	// Reserve: ~42 for Name col, ~10 for Required col, ~8 for separators/padding
+	maxDefaultWidth := 60 // sensible default
+	if w, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && w > 80 {
+		maxDefaultWidth = w - 60
+		if maxDefaultWidth < 30 {
+			maxDefaultWidth = 30
+		}
+	}
+	printMarkdownTableWithWidth([]string{"Name", "Default", "Required"}, rows, maxDefaultWidth)
+}
+
+// printMarkdownTable prints a box-drawing table with left-aligned columns (supports colored cells).
+// The optional align parameter is accepted for backward compatibility but ignored.
+func printMarkdownTable(headers []string, rows [][]string, align ...string) {
+	// Calculate column widths (using display width, not byte length)
+	widths := make([]int, len(headers))
+	for i, h := range headers {
+		widths[i] = displayWidth(h)
+	}
+	for _, row := range rows {
+		for i, cell := range row {
+			dw := displayWidth(cell)
+			if i < len(widths) && dw > widths[i] {
+				widths[i] = dw
+			}
+		}
+	}
+
+	// Print header
+	for i, h := range headers {
+		printAlignedCell(h, widths[i])
+		if i < len(headers)-1 {
+			fmt.Print("│")
+		}
+	}
+	fmt.Println()
+
+	// Print separator with box-drawing characters
+	for i, w := range widths {
+		fmt.Print(strings.Repeat("─", w+2))
+		if i < len(widths)-1 {
+			fmt.Print("┼")
+		}
+	}
+	fmt.Println()
+
+	// Print rows
+	for _, row := range rows {
+		for i := range headers {
+			cell := ""
+			if i < len(row) {
+				cell = row[i]
+			}
+			printAlignedCell(cell, widths[i])
+			if i < len(headers)-1 {
+				fmt.Print("│")
+			}
+		}
+		fmt.Println()
+	}
+}
+
+// printAlignedCell prints a single left-aligned table cell within colWidth.
+func printAlignedCell(cell string, colWidth int) {
+	dw := displayWidth(cell)
+	pad := colWidth - dw
+	if pad < 0 {
+		pad = 0
+	}
+	fmt.Printf(" %s%s ", cell, strings.Repeat(" ", pad))
+}
+
+// wrapText wraps text to maxWidth characters, preserving existing newlines
+func wrapText(text string, maxWidth int) []string {
+	if maxWidth <= 0 {
+		return []string{text}
+	}
+
+	var result []string
+	// Split on existing newlines first
+	lines := strings.Split(text, "\n")
+
+	for _, line := range lines {
+		if len(stripAnsi(line)) <= maxWidth {
+			result = append(result, line)
+			continue
+		}
+
+		// Wrap long lines
+		remaining := line
+		for len(stripAnsi(remaining)) > maxWidth {
+			// Find break point - try to break at space
+			displayLen := 0
+			lastSpace := -1
+			byteIdx := 0
+
+			for byteIdx < len(remaining) && displayLen < maxWidth {
+				if remaining[byteIdx] == '\x1b' {
+					// Skip ANSI escape sequence
+					for byteIdx < len(remaining) && remaining[byteIdx] != 'm' {
+						byteIdx++
+					}
+					if byteIdx < len(remaining) {
+						byteIdx++
+					}
+					continue
+				}
+				if remaining[byteIdx] == ' ' {
+					lastSpace = byteIdx
+				}
+				displayLen++
+				byteIdx++
+			}
+			breakPoint := byteIdx
+
+			// Prefer breaking at space if found
+			if lastSpace > 0 && lastSpace > breakPoint/2 {
+				breakPoint = lastSpace
+			}
+
+			result = append(result, remaining[:breakPoint])
+			remaining = strings.TrimLeft(remaining[breakPoint:], " ")
+		}
+		if remaining != "" {
+			result = append(result, remaining)
+		}
+	}
+
+	return result
+}
+
+// printMarkdownTableWithWidth prints a box-drawing table with column width wrapping
+func printMarkdownTableWithWidth(headers []string, rows [][]string, maxWidth int) {
+	// First pass: wrap all cells and calculate column widths
+	type wrappedRow struct {
+		cells     [][]string // Each cell is a slice of lines
+		maxHeight int
+	}
+
+	var wrappedRows []wrappedRow
+	widths := make([]int, len(headers))
+
+	// Initialize widths with header display widths
+	for i, h := range headers {
+		widths[i] = displayWidth(h)
+	}
+
+	// Wrap each cell and track widths
+	for _, row := range rows {
+		wr := wrappedRow{cells: make([][]string, len(headers))}
+		for i := range headers {
+			cell := ""
+			if i < len(row) {
+				cell = row[i]
+			}
+			wrapped := wrapText(cell, maxWidth)
+			wr.cells[i] = wrapped
+			if len(wrapped) > wr.maxHeight {
+				wr.maxHeight = len(wrapped)
+			}
+			// Track max width for this column
+			for _, line := range wrapped {
+				lw := displayWidth(line)
+				if lw > widths[i] {
+					widths[i] = lw
+				}
+			}
+		}
+		wrappedRows = append(wrappedRows, wr)
+	}
+
+	// Print header
+	for i, h := range headers {
+		printAlignedCell(h, widths[i])
+		if i < len(headers)-1 {
+			fmt.Print("│")
+		}
+	}
+	fmt.Println()
+
+	// Print separator with box-drawing characters
+	for i, w := range widths {
+		fmt.Print(strings.Repeat("─", w+2))
+		if i < len(widths)-1 {
+			fmt.Print("┼")
+		}
+	}
+	fmt.Println()
+
+	// Print rows with multi-line support
+	for _, wr := range wrappedRows {
+		for lineIdx := 0; lineIdx < wr.maxHeight; lineIdx++ {
+			for colIdx := range headers {
+				cell := ""
+				if lineIdx < len(wr.cells[colIdx]) {
+					cell = wr.cells[colIdx][lineIdx]
+				}
+				printAlignedCell(cell, widths[colIdx])
+				if colIdx < len(headers)-1 {
+					fmt.Print("│")
+				}
+			}
+			fmt.Println()
+		}
+	}
+}
+
+// workflowShowCmd shows workflow details
+var workflowShowCmd = &cobra.Command{
+	Use:     "show [name]",
+	Aliases: []string{"view"},
+	Short:   "Show workflow details",
+	Args:    cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cfg := config.Get()
+		if cfg == nil {
+			return fmt.Errorf("configuration not loaded")
+		}
+
+		printer := terminal.NewPrinter()
+		loader := parser.NewLoader(cfg.WorkflowsPath)
+		workflow, err := loader.LoadWorkflow(args[0])
+		if err != nil {
+			// Print detailed error with formatting
+			fmt.Println()
+			printer.Error("Failed to load workflow: %s", args[0])
+			fmt.Println()
+			fmt.Println(err.Error())
+			fmt.Println()
+			return err
+		}
+
+		// Show raw YAML with syntax highlighting when --yaml flag is set
+		if showYaml {
+			content, err := os.ReadFile(workflow.FilePath)
+			if err != nil {
+				return fmt.Errorf("failed to read workflow file: %w", err)
+			}
+
+			// Render with Glamour for syntax highlighting
+			markdown := "```yaml\n" + string(content) + "\n```"
+			renderer, err := glamour.NewTermRenderer(
+				glamour.WithAutoStyle(),
+				glamour.WithWordWrap(120),
+			)
+			if err == nil {
+				rendered, renderErr := renderer.Render(markdown)
+				if renderErr == nil {
+					fmt.Print(rendered)
+					return nil
+				}
+			}
+			// Fallback to plain YAML if rendering fails
+			fmt.Println(string(content))
+			return nil
+		}
+
+		if globalJSON {
+			result := map[string]interface{}{
+				"name":        workflow.Name,
+				"kind":        string(workflow.Kind),
+				"description": workflow.Description,
+				"file_path":   workflow.FilePath,
+				"tags":        workflow.Tags,
+			}
+			if workflow.Hidden {
+				result["hidden"] = true
+			}
+			if workflow.Help != nil {
+				help := map[string]interface{}{}
+				if workflow.Help.Usage != "" {
+					help["usage"] = workflow.Help.Usage
+				}
+				if len(workflow.Help.ExampleTargets) > 0 {
+					help["example_targets"] = workflow.Help.ExampleTargets
+				}
+				if len(help) > 0 {
+					result["help"] = help
+				}
+			}
+			if len(workflow.Params) > 0 {
+				var params []map[string]interface{}
+				for _, p := range workflow.Params {
+					pm := map[string]interface{}{
+						"name":     p.Name,
+						"required": p.Required,
+					}
+					if p.DefaultString() != "" {
+						pm["default"] = p.DefaultString()
+					}
+					params = append(params, pm)
+				}
+				result["params"] = params
+			}
+			if workflow.Dependencies != nil {
+				deps := map[string]interface{}{}
+				if len(workflow.Dependencies.Variables) > 0 {
+					var vars []map[string]interface{}
+					for _, v := range workflow.Dependencies.Variables {
+						vm := map[string]interface{}{
+							"name":     v.Name,
+							"required": v.Required,
+						}
+						if v.Type != "" {
+							vm["type"] = string(v.Type)
+						}
+						vars = append(vars, vm)
+					}
+					deps["variables"] = vars
+				}
+				if len(workflow.Dependencies.TargetTypes) > 0 {
+					var types []string
+					for _, t := range workflow.Dependencies.TargetTypes {
+						types = append(types, string(t))
+					}
+					deps["target_types"] = types
+				}
+				if len(deps) > 0 {
+					result["dependencies"] = deps
+				}
+			}
+			if workflow.IsModule() && len(workflow.Steps) > 0 {
+				var steps []map[string]interface{}
+				for _, s := range workflow.Steps {
+					steps = append(steps, map[string]interface{}{
+						"name": s.Name,
+						"type": string(s.Type),
+					})
+				}
+				result["steps"] = steps
+			}
+			if workflow.IsFlow() && len(workflow.Modules) > 0 {
+				var modules []map[string]interface{}
+				for _, m := range workflow.Modules {
+					mm := map[string]interface{}{
+						"name": m.Name,
+						"path": m.Path,
+					}
+					if len(m.DependsOn) > 0 {
+						mm["depends_on"] = m.DependsOn
+					}
+					modules = append(modules, mm)
+				}
+				result["modules"] = modules
+			}
+			if len(workflow.Triggers) > 0 {
+				var triggers []map[string]interface{}
+				for _, t := range workflow.Triggers {
+					triggers = append(triggers, map[string]interface{}{
+						"name":    t.Name,
+						"type":    string(t.On),
+						"enabled": t.Enabled,
+					})
+				}
+				result["triggers"] = triggers
+			}
+			if workflow.Runner != "" {
+				result["runner"] = string(workflow.Runner)
+			}
+
+			jsonBytes, err := json.MarshalIndent(result, "", "  ")
+			if err != nil {
+				return fmt.Errorf("failed to marshal workflow: %w", err)
+			}
+			fmt.Println(string(jsonBytes))
+			return nil
+		}
+
+		// Default: Table format output
+		// Metadata section
+		fmt.Println()
+		fmt.Println("❯ " + terminal.Bold("Metadata:"))
+		printer.KeyValue("Name", workflow.Name)
+		printer.KeyValue("Kind", terminal.TypeBadge(string(workflow.Kind)))
+		printer.KeyValue("Description", workflow.Description)
+		printer.KeyValue("File", terminal.Gray(workflow.FilePath))
+
+		// For flows, show aggregated module param counts before Usage
+		if workflow.IsFlow() && len(workflow.Modules) > 0 {
+			var totalSpeed, totalToggle, totalCfg, totalGeneral int
+			for _, m := range workflow.Modules {
+				if m.Path == "" {
+					continue
+				}
+				mod, modErr := loader.LoadWorkflow(m.Path)
+				if modErr != nil {
+					continue
+				}
+				mToggle, mSpeed, mCfg, mGeneral := core.CategorizeParams(mod.Params)
+				totalSpeed += len(mSpeed)
+				totalToggle += len(mToggle)
+				totalCfg += len(mCfg)
+				totalGeneral += len(mGeneral)
+			}
+			var aggParts []string
+			if totalSpeed > 0 {
+				aggParts = append(aggParts, fmt.Sprintf("%s speed control", terminal.Magenta(fmt.Sprintf("%d", totalSpeed))))
+			}
+			if totalToggle > 0 {
+				aggParts = append(aggParts, fmt.Sprintf("%s toggle", terminal.Magenta(fmt.Sprintf("%d", totalToggle))))
+			}
+			if totalCfg > 0 {
+				aggParts = append(aggParts, fmt.Sprintf("%s config", terminal.Magenta(fmt.Sprintf("%d", totalCfg))))
+			}
+			if totalGeneral > 0 {
+				aggParts = append(aggParts, fmt.Sprintf("%s general", terminal.Magenta(fmt.Sprintf("%d", totalGeneral))))
+			}
+			if len(aggParts) > 0 {
+				printer.KeyValue("Params", strings.Join(aggParts, ", "))
+			}
+		}
+
+		// Show help info
+		if workflow.Help != nil {
+			if workflow.Help.Usage != "" {
+				if strings.Contains(workflow.Help.Usage, "\n") {
+					fmt.Println("  " + terminal.Gray("Usage") + ":")
+					for _, line := range strings.Split(strings.TrimRight(workflow.Help.Usage, "\n "), "\n") {
+						fmt.Println("    " + terminal.Cyan(line))
+					}
+				} else {
+					printer.KeyValue("Usage", terminal.Cyan(workflow.Help.Usage))
+				}
+			}
+			if len(workflow.Help.ExampleTargets) > 0 {
+				printer.KeyValue("Example Targets", terminal.Yellow(strings.Join(workflow.Help.ExampleTargets, ", ")))
+			}
+		}
+
+		// Show parameters
+		if len(workflow.Params) > 0 {
+			toggle, speed, cfg, general := categorizeParams(workflow.Params)
+
+			// Always show summary counts
+			var parts []string
+			if len(speed) > 0 {
+				parts = append(parts, fmt.Sprintf("%s speed control", terminal.Magenta(fmt.Sprintf("%d", len(speed)))))
+			}
+			if len(toggle) > 0 {
+				parts = append(parts, fmt.Sprintf("%s toggle", terminal.Magenta(fmt.Sprintf("%d", len(toggle)))))
+			}
+			if len(cfg) > 0 {
+				parts = append(parts, fmt.Sprintf("%s config", terminal.Magenta(fmt.Sprintf("%d", len(cfg)))))
+			}
+			if len(general) > 0 {
+				parts = append(parts, fmt.Sprintf("%s general", terminal.Magenta(fmt.Sprintf("%d", len(general)))))
+			}
+			if len(parts) > 0 {
+				printer.KeyValue("Params", strings.Join(parts, ", "))
+			}
+
+			// Show full categorized tables only in verbose mode
+			if showVerbose {
+				printToggleParams(toggle)
+				printSpeedControlParams(speed)
+				printConfigParams(cfg)
+				printGeneralParams(general)
+			}
+		}
+
+		// Show steps (for modules)
+		if workflow.IsModule() && len(workflow.Steps) > 0 {
+			fmt.Println()
+			fmt.Println("◼ " + terminal.Bold("Steps:"))
+			var rows [][]string
+			for i, s := range workflow.Steps {
+				coloredType := terminal.TypeBadge(string(s.Type))
+				rows = append(rows, []string{fmt.Sprintf("%d", i+1), s.Name, coloredType})
+			}
+			printMarkdownTable([]string{"#", "Name", "Type"}, rows)
+		}
+
+		// Show modules (for flows)
+		if workflow.IsFlow() && len(workflow.Modules) > 0 {
+			fmt.Println()
+			fmt.Println("◼ " + terminal.Bold("Modules:"))
+			var rows [][]string
+			for i, m := range workflow.Modules {
+				deps := strings.Join(m.DependsOn, ", ")
+				if deps == "" {
+					deps = "-"
+				}
+				rows = append(rows, []string{fmt.Sprintf("%d", i+1), m.Name, m.Path, deps})
+			}
+			printMarkdownTable([]string{"#", "Name", "Path", "Depends On"}, rows)
+
+			// Load each module and show params
+			fmt.Println()
+			fmt.Println("◆ " + terminal.Bold("Module Parameters:"))
+
+			if showVerbose {
+				// Verbose: collect all params across modules, then render grouped tables
+				var allSpeedRows [][]string
+				var allToggleRows [][]string
+				for _, m := range workflow.Modules {
+					if m.Path == "" {
+						continue
+					}
+					mod, err := loader.LoadWorkflow(m.Path)
+					if err != nil {
+						continue
+					}
+					mToggle, mSpeed, _, _ := core.CategorizeParams(mod.Params)
+					for _, p := range mSpeed {
+						required := terminal.Gray("no")
+						if p.Required {
+							required = terminal.Green("yes")
+						}
+						defaultVal := p.DefaultString()
+						if defaultVal == "" {
+							defaultVal = "-"
+						}
+						allSpeedRows = append(allSpeedRows, []string{terminal.HiBlue(m.Name), terminal.HiBlue(p.Name), terminal.HiBlue(defaultVal), required})
+					}
+					for _, p := range mToggle {
+						required := terminal.Gray("no")
+						if p.Required {
+							required = terminal.Green("yes")
+						}
+						defaultVal := p.DefaultString()
+						if defaultVal == "" {
+							defaultVal = "-"
+						}
+						coloredDefault := defaultVal
+						if strings.ToLower(defaultVal) == "true" {
+							coloredDefault = terminal.Green(defaultVal)
+						} else if strings.ToLower(defaultVal) == "false" {
+							coloredDefault = terminal.Gray(defaultVal)
+						}
+						allToggleRows = append(allToggleRows, []string{terminal.HiCyan(m.Name), terminal.HiCyan(p.Name), coloredDefault, required})
+					}
+				}
+				printSpeedControlParamsGrouped(allSpeedRows)
+				printToggleParamsGrouped(allToggleRows)
+			} else {
+				// Summary: show counts per module
+				for _, m := range workflow.Modules {
+					if m.Path == "" {
+						continue
+					}
+					mod, err := loader.LoadWorkflow(m.Path)
+					if err != nil {
+						continue
+					}
+					mToggle, mSpeed, _, _ := core.CategorizeParams(mod.Params)
+					if len(mToggle)+len(mSpeed) == 0 {
+						continue
+					}
+					var mParts []string
+					if len(mSpeed) > 0 {
+						mParts = append(mParts, fmt.Sprintf("%s speed control", terminal.Magenta(fmt.Sprintf("%d", len(mSpeed)))))
+					}
+					if len(mToggle) > 0 {
+						mParts = append(mParts, fmt.Sprintf("%s toggle", terminal.Magenta(fmt.Sprintf("%d", len(mToggle)))))
+					}
+					printer.KeyValue("  "+m.Name, strings.Join(mParts, ", "))
+				}
+			}
+		}
+
+		// Show triggers
+		if len(workflow.Triggers) > 0 {
+			fmt.Println()
+			fmt.Println("◼ " + terminal.Bold("Triggers:"))
+			var rows [][]string
+			for _, t := range workflow.Triggers {
+				status := terminal.Gray("disabled")
+				if t.Enabled {
+					status = terminal.Green("enabled")
+				}
+				rows = append(rows, []string{t.Name, string(t.On), status})
+			}
+			printMarkdownTable([]string{"Name", "Type", "Status"}, rows)
+		}
+
+		// Show builtin variables
+		fmt.Println()
+		fmt.Println("◆ " + terminal.Bold("Builtin Variables:"))
+
+		if showVerbose {
+			// Verbose: show full aligned markdown table with default values and descriptions
+			// Get actual default values from config where possible
+			baseFolder := "~/osmedeus-base"
+			binariesPath := "~/osmedeus-base/external-binaries"
+			dataPath := "~/osmedeus-base/data"
+			workspacesPath := "~/workspaces-osmedeus"
+			workflowsPath := cfg.WorkflowsPath
+			if cfg.BaseFolder != "" {
+				baseFolder = cfg.BaseFolder
+			}
+			if cfg.BinariesPath != "" {
+				binariesPath = cfg.BinariesPath
+			}
+			if cfg.DataPath != "" {
+				dataPath = cfg.DataPath
+			}
+			if cfg.WorkspacesPath != "" {
+				workspacesPath = cfg.WorkspacesPath
+			}
+
+			// Truncate paths for display
+			truncatePath := func(p string, maxLen int) string {
+				if len(p) <= maxLen {
+					return p
+				}
+				return "..." + p[len(p)-maxLen+3:]
+			}
+
+			builtinVars := [][]string{
+				// Path variables
+				{terminal.Cyan("{{BaseFolder}}"), "Base installation folder", terminal.Gray(truncatePath(baseFolder, 28))},
+				{terminal.Cyan("{{Binaries}}"), "Path to binaries", terminal.Gray(truncatePath(binariesPath, 28))},
+				{terminal.Cyan("{{Data}}"), "Path to data files", terminal.Gray(truncatePath(dataPath, 28))},
+				{terminal.Cyan("{{ExternalConfigs}}"), "Path to external configs", terminal.Gray("{{BaseFolder}}/configs")},
+				{terminal.Cyan("{{ExternalScripts}}"), "Path to external scripts", terminal.Gray("{{BaseFolder}}/scripts")},
+				{terminal.Cyan("{{Workspaces}}"), "Path to workspaces", terminal.Gray(truncatePath(workspacesPath, 28))},
+				{terminal.Cyan("{{Workflows}}"), "Path to workflows", terminal.Gray(truncatePath(workflowsPath, 28))},
+				{terminal.Cyan("{{ExternalMarkdowns}}"), "Path to markdown templates", terminal.Gray("{{BaseFolder}}/markdown-report-templates")},
+				{terminal.Cyan("{{ExternalAgents}}"), "Path to agent configs", terminal.Gray("{{BaseFolder}}/external-agent-configs")},
+
+				// Target variables
+				{terminal.Cyan("{{Target}}"), "Current scan target", terminal.Yellow("<from -t flag>")},
+				{terminal.Cyan("{{TargetFile}}"), "File containing targets", terminal.Yellow("<from -T flag>")},
+				{terminal.Cyan("{{TargetSpace}}"), "Sanitized target path", terminal.Yellow("<sanitized target>")},
+				{terminal.Cyan("{{Output}}"), "Output directory for target", terminal.Gray("{{Workspaces}}/{{TargetSpace}}")},
+
+				// Target type heuristics
+				{terminal.Cyan("{{TargetType}}"), "Target type (url/domain/ip/cidr/file)", terminal.Yellow("<detected>")},
+				{terminal.Cyan("{{TargetRootDomain}}"), "Root domain (domain/URL targets)", terminal.Yellow("<detected>")},
+				{terminal.Cyan("{{TargetTLD}}"), "Top-level domain (domain/URL targets)", terminal.Yellow("<detected>")},
+				{terminal.Cyan("{{TargetSLD}}"), "Second-level domain (domain/URL)", terminal.Yellow("<detected>")},
+				{terminal.Cyan("{{Org}}"), "Alias for TargetSLD", terminal.Yellow("<detected>")},
+				{terminal.Cyan("{{TargetBaseURL}}"), "Base URL (URL targets only)", terminal.Yellow("<detected>")},
+				{terminal.Cyan("{{TargetRootURL}}"), "Root URL (URL targets only)", terminal.Yellow("<detected>")},
+				{terminal.Cyan("{{TargetHostname}}"), "Hostname (URL targets only)", terminal.Yellow("<detected>")},
+				{terminal.Cyan("{{TargetHost}}"), "Host with port (URL targets only)", terminal.Yellow("<detected>")},
+				{terminal.Cyan("{{TargetPort}}"), "Port number (URL targets only)", terminal.Yellow("<detected>")},
+				{terminal.Cyan("{{TargetPath}}"), "URL path (URL targets only)", terminal.Yellow("<detected>")},
+				{terminal.Cyan("{{TargetScheme}}"), "URL scheme (URL targets only)", terminal.Yellow("<detected>")},
+				{terminal.Cyan("{{TargetIsWildcard}}"), "Is wildcard (domain targets only)", terminal.Yellow("<detected>")},
+				{terminal.Cyan("{{TargetResolvedIP}}"), "Resolved IP (domain targets only)", terminal.Yellow("<if resolved>")},
+				{terminal.Cyan("{{TargetStatusCode}}"), "HTTP status (URL targets only)", terminal.Yellow("<if fetched>")},
+				{terminal.Cyan("{{TargetContentLength}}"), "Content length (URL targets only)", terminal.Yellow("<if fetched>")},
+
+				// State files
+				{terminal.Cyan("{{StateExecutionLog}}"), "Path to execution log", terminal.Gray("{{Output}}/run-execution.log")},
+				{terminal.Cyan("{{StateCompletedFile}}"), "Path to run completed JSON", terminal.Gray("{{Output}}/run-completed.json")},
+				{terminal.Cyan("{{StateFile}}"), "Path to run state JSON", terminal.Gray("{{Output}}/run-state.json")},
+				{terminal.Cyan("{{StateWorkflowFile}}"), "Path to workflow YAML", terminal.Gray("{{Output}}/run-workflow.yaml")},
+				{terminal.Cyan("{{StateWorkflowFolder}}"), "Path to workflow modules", terminal.Gray("{{Output}}/run-modules")},
+
+				// Thread/performance variables
+				{terminal.Cyan("{{threads}}"), "Thread count (tactic based)", terminal.Yellow("10 (default tactic)")},
+				{terminal.Cyan("{{baseThreads}}"), "Base thread count", terminal.Yellow("10")},
+
+				// Metadata variables
+				{terminal.Cyan("{{Version}}"), "Osmedeus version", terminal.Gray("<osmedeus version>")},
+				{terminal.Cyan("{{RunUUID}}"), "Unique run identifier (UUID)", terminal.Yellow("<generated>")},
+				{terminal.Cyan("{{TaskDate}}"), "Task date (YYYY-MM-DD)", terminal.Yellow("<current date>")},
+				{terminal.Cyan("{{Today}}"), "Current date (YYYY-MM-DD)", terminal.Yellow("<current date>")},
+				{terminal.Cyan("{{TimeStamp}}"), "Unix timestamp", terminal.Yellow("<unix timestamp>")},
+				{terminal.Cyan("{{CurrentTime}}"), "Current time (ISO 8601)", terminal.Yellow("<ISO 8601 time>")},
+				{terminal.Cyan("{{RandomString}}"), "Random 6-char lowercase letters", terminal.Yellow("<generated>")},
+				{terminal.Cyan("{{ModuleName}}"), "Current module name", terminal.Yellow("<module name>")},
+				{terminal.Cyan("{{FlowName}}"), "Parent flow name (empty if direct)", terminal.Yellow("<flow name or empty>")},
+			}
+			printMarkdownTable([]string{"Variable", "Description", "Default Value"}, builtinVars)
+		} else {
+			// Compact: show variables in columns
+			vars := []string{
+				"{{BaseFolder}}", "{{Binaries}}", "{{Data}}", "{{Workspaces}}",
+				"{{Target}}", "{{Output}}", "{{RunUUID}}", "{{Today}}",
+				"{{threads}}", "{{Version}}", "{{RandomString}}",
+			}
+			for i, v := range vars {
+				fmt.Printf("  %s", terminal.Cyan(v))
+				if (i+1)%4 == 0 {
+					fmt.Println()
+				}
+			}
+			fmt.Println()
+			fmt.Println()
+			fmt.Printf("%s %s\n", terminal.BoldCyan(terminal.SymbolLightning), terminal.Gray("Tip: Use --verbose to show all params, variables with descriptions and default values or --yaml to see raw workflow file"))
+		}
+
+		fmt.Println()
+		return nil
+	},
+}
+
+// workflowInstallCmd installs workflows from a source (alias for install workflow)
+var workflowInstallCmd = &cobra.Command{
+	Use:   "install [source]",
+	Short: "Install workflows from git URL, zip URL, local zip file, or local folder",
+	Long:  `Install workflows from various sources. This is an alias for 'osmedeus install workflow'.`,
+	Args: func(cmd *cobra.Command, args []string) error {
+		if workflowPreset {
+			if len(args) != 0 {
+				return fmt.Errorf("no source argument is allowed with --preset")
+			}
+			return nil
+		}
+		return cobra.ExactArgs(1)(cmd, args)
+	},
+	RunE: RunInstallWorkflow,
+}
+
+// workflowValidateCmd validates a workflow
+var workflowValidateCmd = &cobra.Command{
+	Use:     "validate [name|path|folder]",
+	Aliases: []string{"val", "lint", "fmt"},
+	Short:   "Validate and lint workflow(s) - accepts workflow name, file path, or folder",
+	Long: `Validate and lint workflow YAML file(s).
+
+Accepts:
+  - Workflow name (looks up in workflows directory)
+  - Path to a YAML file
+  - Path to a folder (recursively validates all workflow YAMLs)
+
+The linter checks for:
+  - Missing required fields (name, kind, type)
+  - Undefined variables (referenced but not defined)
+  - Unused variables (exported but never used)
+  - Invalid goto/depends_on references
+  - Circular dependencies
+  - Empty steps
+  - Duplicate step names
+
+Examples:
+  osmedeus workflow validate test-echo
+  osmedeus workflow lint ./my-workflow.yaml
+  osmedeus workflow validate /path/to/workflows/
+  osmedeus workflow validate . --fail-fast
+  osmedeus workflow lint my-workflow.yaml --check --format json
+  osmedeus workflow validate . --disable unused-variable
+  osmedeus workflow lint my-workflow.yaml --severity error`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cfg := config.Get()
+		if cfg == nil {
+			return fmt.Errorf("configuration not loaded")
+		}
+
+		printer := terminal.NewPrinter()
+		input := args[0]
+
+		inputType, resolvedPath := classifyInput(input)
+
+		switch inputType {
+		case "file":
+			return lintFile(resolvedPath, cfg, printer)
+		case "folder":
+			return lintFolder(resolvedPath, cfg, printer, validateFailFast)
+		case "name":
+			return lintByName(input, cfg, printer)
+		}
+
+		return nil
+	},
+}
+
+var showVerbose bool
+var filterTags []string
+var showYaml bool
+var showTags bool
+var showUsage bool
+var searchQuery string
+var validateFailFast bool
+
+// Linter flags
+var lintCheck bool
+var lintFormat string
+var lintDisable []string
+var lintSeverity string
+
+func init() {
+	workflowShowCmd.Flags().BoolVarP(&showVerbose, "verbose", "v", false, "show detailed variable descriptions")
+	workflowShowCmd.Flags().BoolVar(&showYaml, "yaml", false, "show raw YAML instead of table format")
+	workflowListCmd.Flags().StringSliceVar(&filterTags, "tags", []string{}, "filter workflows by tags (comma-separated)")
+	workflowListCmd.Flags().BoolVar(&showTags, "show-tags", false, "show tags column in output")
+	workflowListCmd.Flags().BoolVar(&showUsage, "usage", false, "show usage info below description")
+	workflowListCmd.Flags().StringVar(&searchQuery, "search", "", "filter workflows by name, description, or tags")
+	workflowListCmd.Flags().BoolVarP(&showVerbose, "verbose", "v", false, "show workflows with errors")
+	workflowValidateCmd.Flags().BoolVar(&validateFailFast, "fail-fast", false, "stop on first validation failure")
+	workflowValidateCmd.Flags().BoolVar(&lintCheck, "check", false, "exit with error code if issues found (for CI)")
+	workflowValidateCmd.Flags().StringVar(&lintFormat, "format", "pretty", "output format: pretty, json, github")
+	workflowValidateCmd.Flags().StringSliceVar(&lintDisable, "disable", []string{}, "disable specific rules (comma-separated)")
+	workflowValidateCmd.Flags().StringVar(&lintSeverity, "severity", "info", "minimum severity level: info, warning, error")
+	workflowInstallCmd.Flags().BoolVar(&workflowPreset, "preset", false, "install from OSM_WORKFLOW_URL environment variable (default: DEFAULT_WORKFLOW_REPO)")
+	workflowCmd.AddCommand(workflowListCmd)
+	workflowCmd.AddCommand(workflowShowCmd)
+	workflowCmd.AddCommand(workflowValidateCmd)
+	workflowCmd.AddCommand(workflowInstallCmd)
+}
+
+// hasMatchingTags checks if a workflow has any of the specified tags
+func hasMatchingTags(wf *core.Workflow, tags []string) bool {
+	if len(tags) == 0 {
+		return true
+	}
+	for _, filterTag := range tags {
+		for _, wfTag := range wf.Tags {
+			if strings.EqualFold(wfTag, filterTag) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// matchesSearch checks if a workflow matches a search term (case-insensitive substring match)
+func matchesSearch(wf *core.Workflow, name, searchTerm string) bool {
+	lower := strings.ToLower(searchTerm)
+	if strings.Contains(strings.ToLower(name), lower) {
+		return true
+	}
+	if strings.Contains(strings.ToLower(wf.Description), lower) {
+		return true
+	}
+	for _, tag := range wf.Tags {
+		if strings.Contains(strings.ToLower(tag), lower) {
+			return true
+		}
+	}
+	return false
+}
+
+// classifyInput determines if input is a file path, folder path, or workflow name
+func classifyInput(input string) (inputType string, resolvedPath string) {
+	if info, err := os.Stat(input); err == nil {
+		absPath, _ := filepath.Abs(input)
+		if info.IsDir() {
+			return "folder", absPath
+		}
+		return "file", absPath
+	}
+
+	// Check if it looks like a path
+	if strings.Contains(input, string(filepath.Separator)) ||
+		strings.Contains(input, "/") ||
+		strings.HasSuffix(input, ".yaml") ||
+		strings.HasSuffix(input, ".yml") {
+		absPath, _ := filepath.Abs(input)
+		return "file", absPath
+	}
+
+	return "name", input
+}
+
+// isWorkflowYAML checks if file contains kind: module or kind: flow
+func isWorkflowYAML(path string) bool {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+
+	contentStr := string(content)
+	if !strings.Contains(contentStr, "kind:") {
+		return false
+	}
+
+	kindPattern := regexp.MustCompile(`(?m)^kind:\s*['"]?(module|flow)['"]?\s*$`)
+	return kindPattern.Match(content)
+}
+
+// findWorkflowFiles recursively finds workflow YAML files in directory
+func findWorkflowFiles(dir string) ([]string, error) {
+	var files []string
+
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // Skip inaccessible files
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(path, ".yaml") && !strings.HasSuffix(path, ".yml") {
+			return nil
+		}
+		if isWorkflowYAML(path) {
+			files = append(files, path)
+		}
+		return nil
+	})
+
+	return files, err
+}
+
+// createLinter creates a linter with the current CLI options
+func createLinter() *linter.Linter {
+	opts := linter.LinterOptions{
+		DisabledRules: lintDisable,
+		MinSeverity:   linter.ParseSeverity(lintSeverity),
+	}
+	return linter.NewLinter(opts)
+}
+
+// lintByName lints a workflow by name
+func lintByName(name string, cfg *config.Config, printer *terminal.Printer) error {
+	loader := parser.NewLoader(cfg.WorkflowsPath)
+	workflow, err := loader.LoadWorkflow(name)
+	if err != nil {
+		fmt.Println()
+		printer.Error("Failed to load workflow: %s", name)
+		fmt.Println()
+		fmt.Println(err.Error())
+		fmt.Println()
+		return err
+	}
+
+	// Use the FilePath from the parsed workflow
+	if workflow.FilePath == "" {
+		return fmt.Errorf("could not determine workflow file path for: %s", name)
+	}
+
+	return lintWorkflowFile(workflow.FilePath, workflow, printer)
+}
+
+// lintFile lints a single workflow file
+func lintFile(path string, _ *config.Config, printer *terminal.Printer) error {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return fmt.Errorf("file not found: %s", path)
+	}
+
+	if !isWorkflowYAML(path) {
+		printer.Warning("File does not contain 'kind: module' or 'kind: flow': %s", path)
+		return fmt.Errorf("not a workflow file")
+	}
+
+	// Parse the workflow first
+	p := parser.NewParser()
+	workflow, err := p.Parse(path)
+	if err != nil {
+		printer.Error("Parse error: %s", err)
+		return err
+	}
+
+	return lintWorkflowFile(path, workflow, printer)
+}
+
+// lintWorkflowFile lints a parsed workflow file
+func lintWorkflowFile(path string, workflow *core.Workflow, printer *terminal.Printer) error {
+	// Read source for context display
+	source, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("failed to read file: %w", err)
+	}
+
+	// Create and run linter
+	l := createLinter()
+	result, err := l.LintContent(source, path)
+	if err != nil {
+		printer.Error("Lint error: %s", err)
+		return err
+	}
+
+	// Format and print results
+	format := linter.ParseOutputFormat(lintFormat)
+	formatter := linter.GetFormatter(format, true)
+
+	if result.HasIssues() {
+		output := formatter.Format(result, source)
+		fmt.Println()
+		fmt.Print(output)
+		fmt.Println(formatter.FormatSummary([]*linter.LintResult{result}))
+		fmt.Println()
+	} else {
+		printer.Success("Workflow '%s' (%s) passed all lint checks", workflow.Name, workflow.Kind)
+	}
+
+	// Return error if --check mode and errors found
+	if lintCheck && result.HasErrors() {
+		return fmt.Errorf("lint check failed with %d error(s)", result.Errors)
+	}
+
+	return nil
+}
+
+// lintFolder lints all workflow files in a folder
+func lintFolder(dir string, _ *config.Config, printer *terminal.Printer, failFast bool) error {
+	fmt.Println()
+	printer.Info("Scanning for workflow files in: %s", terminal.Cyan(dir))
+
+	files, err := findWorkflowFiles(dir)
+	if err != nil {
+		return fmt.Errorf("failed to scan directory: %w", err)
+	}
+
+	if len(files) == 0 {
+		printer.Warning("No workflow YAML files found in %s", dir)
+		return nil
+	}
+
+	printer.Info("Found %d workflow file(s)", len(files))
+	fmt.Println()
+
+	l := createLinter()
+	format := linter.ParseOutputFormat(lintFormat)
+	formatter := linter.GetFormatter(format, true)
+
+	var results []*linter.LintResult
+	var hasErrors bool
+
+	for _, file := range files {
+		source, readErr := os.ReadFile(file)
+		if readErr != nil {
+			printer.Warning("Could not read %s: %s", file, readErr)
+			continue
+		}
+
+		result, lintErr := l.LintContent(source, file)
+		if lintErr != nil {
+			// Parse errors become error issues
+			result = &linter.LintResult{
+				FilePath: file,
+				Issues: []linter.LintIssue{{
+					Rule:     "parse-error",
+					Severity: linter.SeverityError,
+					Message:  lintErr.Error(),
+					Line:     1,
+					Column:   1,
+				}},
+				Errors: 1,
+			}
+		}
+
+		results = append(results, result)
+
+		if result.HasIssues() {
+			output := formatter.Format(result, source)
+			fmt.Print(output)
+		}
+
+		if result.HasErrors() {
+			hasErrors = true
+			if failFast {
+				fmt.Println()
+				fmt.Println(formatter.FormatSummary(results))
+				return fmt.Errorf("lint check failed")
+			}
+		}
+	}
+
+	fmt.Println()
+	fmt.Println(formatter.FormatSummary(results))
+	fmt.Println()
+
+	// Summary stats
+	totalErrors := linter.TotalErrors(results)
+	totalWarnings := linter.TotalWarnings(results)
+	filesWithIssues := 0
+	for _, r := range results {
+		if r.HasIssues() {
+			filesWithIssues++
+		}
+	}
+
+	printer.Info("Linted %d file(s): %s errors, %s warnings in %d file(s)",
+		len(files),
+		terminal.Red(fmt.Sprintf("%d", totalErrors)),
+		terminal.Yellow(fmt.Sprintf("%d", totalWarnings)),
+		filesWithIssues)
+
+	if lintCheck && hasErrors {
+		return fmt.Errorf("lint check failed with %d error(s)", totalErrors)
+	}
+
+	return nil
+}

@@ -1,0 +1,23 @@
+name: test-trigger-event
+kind: module
+description: Test event-based trigger
+tags: test,trigger,event
+
+triggers:
+  - name: on-new-asset
+    on: event
+    event:
+      topic: "assets.new"
+      filters:
+        - "event.source == 'test'"
+    enabled: true
+
+    
+params:
+  - name: target
+    required: true
+
+steps:
+  - name: process-asset
+    type: bash
+    command: 'echo "New asset discovered: {{target}}"'

@@ -1,0 +1,44 @@
+name: test-debounce-dedupe
+kind: module
+desc: Test workflow for debounce and deduplication features
+
+params:
+  - name: output
+    default: "/tmp/debounce-dedupe-test"
+
+triggers:
+  # Watch trigger with debounce - waits 500ms after last change before triggering
+  - name: on-asset-change
+    on: watch
+    path: "{{output}}/assets.txt"
+    debounce: 500ms
+    enabled: true
+
+  # Event trigger with deduplication - ignores duplicate events within 10s window
+  - name: on-new-asset
+    on: event
+    event:
+      topic: "assets.new"
+      dedupe_key: "{{event.source}}-{{event.data.url}}"
+      dedupe_window: 10s
+    enabled: true
+
+  # Event trigger with filters and deduplication
+  - name: on-critical-vuln
+    on: event
+    event:
+      topic: "vulnerabilities.new"
+      filters:
+        - "event.data.severity == 'critical'"
+      dedupe_key: "{{event.data.template}}-{{event.data.host}}"
+      dedupe_window: 5m
+    enabled: true
+
+steps:
+  - name: log-event
+    type: function
+    function: 'log_info("Trigger fired: {{_step_name}}")'
+
+  - name: process-target
+    type: bash
+    command: echo "Processing target {{target}}"
